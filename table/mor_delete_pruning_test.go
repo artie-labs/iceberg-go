@@ -84,17 +84,23 @@ func newMergeOnReadTestTable(t *testing.T) *table.Table {
 func newMergeOnReadTestTableVersion(t *testing.T, formatVersion string) *table.Table {
 	t.Helper()
 
+	return newMergeOnReadTestTableProps(t, iceberg.Properties{
+		table.PropertyFormatVersion:   formatVersion,
+		table.ParquetRowGroupLimitKey: "5",
+	})
+}
+
+// newMergeOnReadTestTableProps builds a merge-on-read table of id and data with the given properties.
+func newMergeOnReadTestTableProps(t *testing.T, props iceberg.Properties) *table.Table {
+	t.Helper()
+
 	location := filepath.ToSlash(t.TempDir())
 	schema := iceberg.NewSchema(0,
 		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
 		iceberg.NestedField{ID: 2, Name: "data", Type: iceberg.PrimitiveTypes.String, Required: false},
 	)
-	meta, err := table.NewMetadata(schema, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, location,
-		iceberg.Properties{
-			table.PropertyFormatVersion:   formatVersion,
-			table.WriteDeleteModeKey:      table.WriteModeMergeOnRead,
-			table.ParquetRowGroupLimitKey: "5",
-		})
+	props[table.WriteDeleteModeKey] = table.WriteModeMergeOnRead
+	meta, err := table.NewMetadata(schema, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, location, props)
 	require.NoError(t, err)
 
 	metaLoc := location + "/metadata/v1.metadata.json"
@@ -299,23 +305,11 @@ func idsInTable(t *testing.T, tbl *table.Table) []int64 {
 // fail the delete.
 func TestMergeOnReadDeleteReadsOnlyFilterColumns(t *testing.T) {
 	ctx := context.Background()
-	location := filepath.ToSlash(t.TempDir())
-	schema := iceberg.NewSchema(0,
-		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
-		iceberg.NestedField{ID: 2, Name: "data", Type: iceberg.PrimitiveTypes.String, Required: false},
-	)
-	meta, err := table.NewMetadata(schema, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, location,
-		iceberg.Properties{
-			table.PropertyFormatVersion:   "2",
-			table.WriteDeleteModeKey:      table.WriteModeMergeOnRead,
-			table.ParquetCompressionKey:   "uncompressed",
-			table.ParquetPageSizeBytesKey: "268435456",
-		})
-	require.NoError(t, err)
-	metaLoc := location + "/metadata/v1.metadata.json"
-	fsF := func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }
-	tbl := table.New(table.Identifier{"db", "mor_delete_projection"}, meta, metaLoc, fsF,
-		&concurrentTestCatalog{metadata: meta, location: metaLoc, fsF: fsF})
+	tbl := newMergeOnReadTestTableProps(t, iceberg.Properties{
+		table.PropertyFormatVersion:   "2",
+		table.ParquetCompressionKey:   "uncompressed",
+		table.ParquetPageSizeBytesKey: "268435456",
+	})
 
 	arrowSchema := arrow.NewSchema([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
@@ -338,4 +332,36 @@ func TestMergeOnReadDeleteReadsOnlyFilterColumns(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, []int64{1}, idsInTable(t, tbl))
+}
+
+// TestMergeOnReadDeleteOnColumnAddedLater deletes by a column that older data
+// files don't have, so those files hold none of the filter's columns.
+func TestMergeOnReadDeleteOnColumnAddedLater(t *testing.T) {
+	ctx := context.Background()
+	tbl := newMergeOnReadTestTable(t)
+
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "data", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	data, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{
+		`[{"id":1,"data":"a"},{"id":2,"data":"b"},{"id":3,"data":"c"}]`,
+	})
+	require.NoError(t, err)
+	defer data.Release()
+	tbl, err = tbl.Append(ctx, array.NewTableReader(data, -1), nil)
+	require.NoError(t, err)
+
+	txn := tbl.NewTransaction()
+	require.NoError(t, txn.UpdateSchema(true, false).AddColumn([]string{"extra"}, iceberg.PrimitiveTypes.String, "", false, nil).Commit())
+	tbl, err = txn.Commit(ctx)
+	require.NoError(t, err)
+
+	tbl, err = tbl.Delete(ctx, iceberg.NotNull(iceberg.Reference("extra")), nil)
+	require.NoError(t, err)
+	assert.Equal(t, []int64{1, 2, 3}, idsInTable(t, tbl), "no row has extra set")
+
+	tbl, err = tbl.Delete(ctx, iceberg.IsNull(iceberg.Reference("extra")), nil)
+	require.NoError(t, err)
+	assert.Empty(t, idsInTable(t, tbl))
 }
