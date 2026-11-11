@@ -21,6 +21,7 @@ import (
 	"context"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -83,17 +84,23 @@ func newMergeOnReadTestTable(t *testing.T) *table.Table {
 func newMergeOnReadTestTableVersion(t *testing.T, formatVersion string) *table.Table {
 	t.Helper()
 
+	return newMergeOnReadTestTableProps(t, iceberg.Properties{
+		table.PropertyFormatVersion:   formatVersion,
+		table.ParquetRowGroupLimitKey: "5",
+	})
+}
+
+// newMergeOnReadTestTableProps builds a merge-on-read table of id and data with the given properties.
+func newMergeOnReadTestTableProps(t *testing.T, props iceberg.Properties) *table.Table {
+	t.Helper()
+
 	location := filepath.ToSlash(t.TempDir())
 	schema := iceberg.NewSchema(0,
 		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
 		iceberg.NestedField{ID: 2, Name: "data", Type: iceberg.PrimitiveTypes.String, Required: false},
 	)
-	meta, err := table.NewMetadata(schema, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, location,
-		iceberg.Properties{
-			table.PropertyFormatVersion:   formatVersion,
-			table.WriteDeleteModeKey:      table.WriteModeMergeOnRead,
-			table.ParquetRowGroupLimitKey: "5",
-		})
+	props[table.WriteDeleteModeKey] = table.WriteModeMergeOnRead
+	meta, err := table.NewMetadata(schema, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, location, props)
 	require.NoError(t, err)
 
 	metaLoc := location + "/metadata/v1.metadata.json"
@@ -273,7 +280,7 @@ func liveDVCount(t *testing.T, tbl *table.Table) int {
 func idsInTable(t *testing.T, tbl *table.Table) []int64 {
 	t.Helper()
 
-	_, itr, err := tbl.Scan().ToArrowRecords(context.Background())
+	_, itr, err := tbl.Scan(table.WithSelectedFields("id")).ToArrowRecords(context.Background())
 	require.NoError(t, err)
 
 	var ids []int64
@@ -290,4 +297,71 @@ func idsInTable(t *testing.T, tbl *table.Table) []int64 {
 	slices.Sort(ids)
 
 	return ids
+}
+
+// TestMergeOnReadDeleteReadsOnlyFilterColumns checks that generating position
+// deletes reads only the columns the filter references. The data column holds
+// a page larger than arrow-go's 64 MiB default read limit, so reading it would
+// fail the delete.
+func TestMergeOnReadDeleteReadsOnlyFilterColumns(t *testing.T) {
+	ctx := context.Background()
+	tbl := newMergeOnReadTestTableProps(t, iceberg.Properties{
+		table.PropertyFormatVersion:   "2",
+		table.ParquetCompressionKey:   "uncompressed",
+		table.ParquetPageSizeBytesKey: "268435456",
+	})
+
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "data", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	bldr := array.NewRecordBuilder(memory.DefaultAllocator, arrowSchema)
+	defer bldr.Release()
+	bldr.Field(0).(*array.Int64Builder).AppendValues([]int64{1, 2}, nil)
+	bldr.Field(1).(*array.StringBuilder).AppendValues([]string{strings.Repeat("x", 70*1024*1024), "small"}, nil)
+	rec := bldr.NewRecordBatch()
+	defer rec.Release()
+	rdr, err := array.NewRecordReader(arrowSchema, []arrow.RecordBatch{rec})
+	require.NoError(t, err)
+	defer rdr.Release()
+
+	tbl, err = tbl.Append(ctx, rdr, nil)
+	require.NoError(t, err)
+
+	tbl, err = tbl.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), int64(2)), nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, []int64{1}, idsInTable(t, tbl))
+}
+
+// TestMergeOnReadDeleteOnColumnAddedLater deletes by a column that older data
+// files don't have, so those files hold none of the filter's columns.
+func TestMergeOnReadDeleteOnColumnAddedLater(t *testing.T) {
+	ctx := context.Background()
+	tbl := newMergeOnReadTestTable(t)
+
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "data", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	data, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{
+		`[{"id":1,"data":"a"},{"id":2,"data":"b"},{"id":3,"data":"c"}]`,
+	})
+	require.NoError(t, err)
+	defer data.Release()
+	tbl, err = tbl.Append(ctx, array.NewTableReader(data, -1), nil)
+	require.NoError(t, err)
+
+	txn := tbl.NewTransaction()
+	require.NoError(t, txn.UpdateSchema(true, false).AddColumn([]string{"extra"}, iceberg.PrimitiveTypes.String, "", false, nil).Commit())
+	tbl, err = txn.Commit(ctx)
+	require.NoError(t, err)
+
+	tbl, err = tbl.Delete(ctx, iceberg.NotNull(iceberg.Reference("extra")), nil)
+	require.NoError(t, err)
+	assert.Equal(t, []int64{1, 2, 3}, idsInTable(t, tbl), "no row has extra set")
+
+	tbl, err = tbl.Delete(ctx, iceberg.IsNull(iceberg.Reference("extra")), nil)
+	require.NoError(t, err)
+	assert.Empty(t, idsInTable(t, tbl))
 }
