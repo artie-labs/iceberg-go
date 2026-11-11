@@ -21,6 +21,7 @@ import (
 	"context"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -273,7 +274,7 @@ func liveDVCount(t *testing.T, tbl *table.Table) int {
 func idsInTable(t *testing.T, tbl *table.Table) []int64 {
 	t.Helper()
 
-	_, itr, err := tbl.Scan().ToArrowRecords(context.Background())
+	_, itr, err := tbl.Scan(table.WithSelectedFields("id")).ToArrowRecords(context.Background())
 	require.NoError(t, err)
 
 	var ids []int64
@@ -290,4 +291,51 @@ func idsInTable(t *testing.T, tbl *table.Table) []int64 {
 	slices.Sort(ids)
 
 	return ids
+}
+
+// TestMergeOnReadDeleteReadsOnlyFilterColumns checks that generating position
+// deletes reads only the columns the filter references. The data column holds
+// a page larger than arrow-go's 64 MiB default read limit, so reading it would
+// fail the delete.
+func TestMergeOnReadDeleteReadsOnlyFilterColumns(t *testing.T) {
+	ctx := context.Background()
+	location := filepath.ToSlash(t.TempDir())
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "data", Type: iceberg.PrimitiveTypes.String, Required: false},
+	)
+	meta, err := table.NewMetadata(schema, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, location,
+		iceberg.Properties{
+			table.PropertyFormatVersion:   "2",
+			table.WriteDeleteModeKey:      table.WriteModeMergeOnRead,
+			table.ParquetCompressionKey:   "uncompressed",
+			table.ParquetPageSizeBytesKey: "268435456",
+		})
+	require.NoError(t, err)
+	metaLoc := location + "/metadata/v1.metadata.json"
+	fsF := func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }
+	tbl := table.New(table.Identifier{"db", "mor_delete_projection"}, meta, metaLoc, fsF,
+		&concurrentTestCatalog{metadata: meta, location: metaLoc, fsF: fsF})
+
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "data", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	bldr := array.NewRecordBuilder(memory.DefaultAllocator, arrowSchema)
+	defer bldr.Release()
+	bldr.Field(0).(*array.Int64Builder).AppendValues([]int64{1, 2}, nil)
+	bldr.Field(1).(*array.StringBuilder).AppendValues([]string{strings.Repeat("x", 70*1024*1024), "small"}, nil)
+	rec := bldr.NewRecordBatch()
+	defer rec.Release()
+	rdr, err := array.NewRecordReader(arrowSchema, []arrow.RecordBatch{rec})
+	require.NoError(t, err)
+	defer rdr.Release()
+
+	tbl, err = tbl.Append(ctx, rdr, nil)
+	require.NoError(t, err)
+
+	tbl, err = tbl.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), int64(2)), nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, []int64{1}, idsInTable(t, tbl))
 }
