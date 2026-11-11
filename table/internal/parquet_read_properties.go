@@ -28,12 +28,13 @@ import (
 	"github.com/apache/iceberg-go"
 )
 
+// Spark can write pages larger than arrow-go's 64 MiB default, so raise the read limits.
 const (
 	ParquetMaxCompressedPageSizeBytesKey     = "read.parquet.max-compressed-page-size-bytes"
-	ParquetMaxCompressedPageSizeBytesDefault = parquet.DefaultMaxCompressedPageSize
+	ParquetMaxCompressedPageSizeBytesDefault = 250 * 1024 * 1024
 
 	ParquetMaxUncompressedPageSizeBytesKey     = "read.parquet.max-uncompressed-page-size-bytes"
-	ParquetMaxUncompressedPageSizeBytesDefault = parquet.DefaultMaxUncompressedPageSize
+	ParquetMaxUncompressedPageSizeBytesDefault = 1024 * 1024 * 1024
 )
 
 func parquetPageLimit(props iceberg.Properties, key string, fallback int64) (int64, error) {

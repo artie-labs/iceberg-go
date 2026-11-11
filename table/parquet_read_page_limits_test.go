@@ -55,7 +55,9 @@ func TestParquetReadPageLimitsScanOverrideAndDelete(t *testing.T) {
 	tbl, err = tbl.Append(t.Context(), reader, nil)
 	require.NoError(t, err)
 
-	_, records, err := tbl.Scan().ToArrowRecords(t.Context())
+	_, records, err := tbl.Scan(table.WithOptions(iceberg.Properties{
+		table.ParquetMaxCompressedPageSizeBytesKey: "67108864",
+	})).ToArrowRecords(t.Context())
 	require.NoError(t, err)
 	var readErr error
 	for record, err := range records {

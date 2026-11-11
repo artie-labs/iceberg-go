@@ -39,8 +39,8 @@ import (
 func TestParquetReadPageLimitDefaultsAndValidation(t *testing.T) {
 	props, err := newParquetReaderProperties(t.Context(), nil)
 	require.NoError(t, err)
-	require.Equal(t, parquet.DefaultMaxCompressedPageSize, props.MaxCompressedPageSize)
-	require.Equal(t, parquet.DefaultMaxUncompressedPageSize, props.MaxUncompressedPageSize)
+	require.Equal(t, int64(ParquetMaxCompressedPageSizeBytesDefault), props.MaxCompressedPageSize)
+	require.Equal(t, int64(ParquetMaxUncompressedPageSizeBytesDefault), props.MaxUncompressedPageSize)
 	for _, key := range []string{ParquetMaxCompressedPageSizeBytesKey, ParquetMaxUncompressedPageSizeBytesKey} {
 		for _, invalid := range []string{"", "0", "-1", "abc", "1.5", "2147483648", "9223372036854775808"} {
 			t.Run(key+"/"+invalid, func(t *testing.T) {
