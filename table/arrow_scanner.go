@@ -2293,6 +2293,21 @@ func (as *arrowScan) producePosDeletesFromTask(ctx context.Context, task tblutil
 	if err != nil {
 		return err
 	}
+	if len(colIndices) == 0 {
+		// The file has none of the filter's columns (e.g. they were added later), so read every column to get its rows.
+		if err = rdr.Close(); err != nil {
+			return err
+		}
+		all := *invariants
+		all.projectedIDs = set[int]{}
+		for _, field := range invariants.tableSchema.Fields() {
+			collectLeafIDs(field.Type, field.ID, all.projectedIDs)
+		}
+		iceSchema, colIndices, rdr, err = as.prepareToRead(ctx, task.Value.File, &all)
+		if err != nil {
+			return err
+		}
+	}
 	defer iceinternal.CheckedClose(rdr, &err)
 	filterPlans, err = as.cachedFileFilterPlans(
 		iceSchema, task.Value.File.FileFormat() == iceberg.ParquetFile)
