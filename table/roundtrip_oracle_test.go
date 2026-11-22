@@ -43,7 +43,7 @@ import (
 )
 
 // The round-trip oracle runs a random, seeded sequence of appends (from Go and
-// from Spark), deletes and column adds against one table. It keeps the expected
+// from Spark), deletes and column adds against one merge-on-read table. It keeps the expected
 // rows in memory, checks a Go scan after every op and a Spark read at the end.
 // Opt-in: ORACLE_SEEDS=1,2,3 make integration-oracle. Replay a failure with its seed.
 
@@ -302,6 +302,9 @@ func (s *SparkIntegrationTestSuite) TestRoundTripOracle() {
 		steps = v
 	}
 	for _, seedStr := range strings.Split(seeds, ",") {
+		if strings.TrimSpace(seedStr) == "" {
+			continue
+		}
 		seed, err := strconv.ParseInt(strings.TrimSpace(seedStr), 10, 64)
 		s.Require().NoError(err)
 		s.Run(fmt.Sprintf("seed=%d", seed), func() {
@@ -326,20 +329,19 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 		o.cols = append(o.cols, c)
 		fields = append(fields, iceberg.NestedField{ID: i + 2, Name: c.name, Type: c.typ})
 	}
-	mode := []string{table.WriteModeCopyOnWrite, table.WriteModeMergeOnRead}[o.rng.Intn(2)]
 	name := fmt.Sprintf("go_oracle_%d", seed)
 	ident := catalog.ToIdentifier("default", name)
 	_ = s.cat.DropTable(s.ctx, ident)
 	tbl, err := s.cat.CreateTable(s.ctx, ident, iceberg.NewSchema(0, fields...),
 		catalog.WithProperties(iceberg.Properties{
 			table.PropertyFormatVersion:   "2",
-			table.WriteDeleteModeKey:      mode,
+			table.WriteDeleteModeKey:      table.WriteModeMergeOnRead, // what transfer uses
 			table.ParquetRowGroupLimitKey: "5",
 		}))
 	if err != nil {
 		return fail("create: %v", err)
 	}
-	o.ops = append(o.ops, fmt.Sprintf("create %s cols=%v", mode, o.cols))
+	o.ops = append(o.ops, fmt.Sprintf("create merge-on-read cols=%v", o.cols))
 
 	for step := range steps {
 		op := o.rng.Intn(100)
