@@ -24,7 +24,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"maps"
 	"math"
 	"slices"
 	"sync"
@@ -50,9 +49,41 @@ var ErrAmbiguousEqualityColumn = errors.New("equality delete column is ambiguous
 // produce separate sets. The set is immutable after construction so it
 // can be shared by tasks with the same delete files.
 type equalityDeleteSet struct {
-	keys     set[string]
+	keys set[string]
+	// more are the keys of the other delete files combined into this set. They're checked after keys rather than
+	// copied into it: a scan's data files each see a different group of delete files (only deletes with a higher
+	// sequence number apply), so copying built one map per group and grew with the square of the commits.
+	more     []set[string]
 	fieldIDs []int
 	colNames []string
+}
+
+// has reports whether key is deleted by any of the set's delete files.
+func (s *equalityDeleteSet) has(key string) bool {
+	if _, ok := s.keys[key]; ok {
+		return true
+	}
+	for _, keys := range s.more {
+		if _, ok := keys[key]; ok {
+			return true
+		}
+	}
+
+	return false
+}
+
+// empty reports whether no delete file in the set has a key.
+func (s *equalityDeleteSet) empty() bool {
+	if len(s.keys) > 0 {
+		return false
+	}
+	for _, keys := range s.more {
+		if len(keys) > 0 {
+			return false
+		}
+	}
+
+	return true
 }
 
 type arrowFieldRef struct {
@@ -670,7 +701,7 @@ func buildEqualityDeleteSetsForTask(
 		}
 
 		deleteSet := combine(groupFiles)
-		if len(deleteSet.keys) == 0 {
+		if deleteSet.empty() {
 			return nil
 		}
 
@@ -680,7 +711,7 @@ func buildEqualityDeleteSetsForTask(
 	sets := make([]*equalityDeleteSet, 0, len(groups))
 	for _, files := range groups {
 		deleteSet := combine(files)
-		if len(deleteSet.keys) > 0 {
+		if !deleteSet.empty() {
 			sets = append(sets, deleteSet)
 		}
 	}
@@ -742,6 +773,7 @@ func equalityDeleteSetCombinationKey(files []*equalityDeleteFileSet) string {
 }
 
 func mergeEqualityDeleteSets(files []*equalityDeleteFileSet) *equalityDeleteSet {
+	// The largest file goes first, since most deleted keys are found there.
 	largest := 0
 	for i := 1; i < len(files); i++ {
 		if len(files[i].keys) > len(files[largest].keys) {
@@ -750,18 +782,15 @@ func mergeEqualityDeleteSets(files []*equalityDeleteFileSet) *equalityDeleteSet 
 	}
 
 	deleteSet := &equalityDeleteSet{
-		keys:     maps.Clone(files[largest].keys),
+		keys:     files[largest].keys,
 		fieldIDs: files[0].fieldIDs,
 		colNames: files[0].colNames,
 	}
 	for i, file := range files {
-		if i == largest {
+		if i == largest || len(file.keys) == 0 {
 			continue
 		}
-
-		for key := range file.keys {
-			deleteSet.keys[key] = struct{}{}
-		}
+		deleteSet.more = append(deleteSet.more, file.keys)
 	}
 
 	return deleteSet
@@ -1219,7 +1248,7 @@ func processEqualityDeletesColumnarForFile(ctx context.Context, eqDeleteSets []*
 					enc(&keyBuf, row)
 				}
 
-				if _, deleted := eqDel.keys[bufString(&keyBuf)]; !deleted {
+				if !eqDel.has(bufString(&keyBuf)) {
 					continue
 				}
 

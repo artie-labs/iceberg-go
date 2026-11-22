@@ -136,7 +136,7 @@ func buildEqualityDeleteSetsPerTaskWithCopies(
 
 		sets := make([]*equalityDeleteSet, 0, len(groups))
 		for _, deleteSet := range groups {
-			if len(deleteSet.keys) > 0 {
+			if !deleteSet.empty() {
 				sets = append(sets, deleteSet)
 			}
 		}
