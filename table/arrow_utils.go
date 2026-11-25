@@ -2309,9 +2309,10 @@ func positionDeleteRecordsToDataFilesDV(ctx context.Context, rootLocation string
 		// Seed the writer with any deletion vector the referenced data file
 		// already carries so its previously deleted positions survive into the
 		// merged DV. The scan that produced args.itr does NOT apply the existing
-		// DVs (makePositionDeleteRecordsForFilter builds its FileScanTasks
-		// without DeleteFiles), so the incoming batches may re-report positions
-		// already in the old DV; re-Setting them on top of the seed is a no-op
+		// DVs (makePositionDeleteRecordsForFilter attaches only Parquet position
+		// deletes, never DeletionVectorFiles), so the incoming batches may
+		// re-report positions already in the old DV; re-Setting them on top of
+		// the seed is a no-op
 		// because the bitmap is idempotent. The seed is what guarantees the old
 		// positions survive — do not remove it, or a second delete would drop
 		// the earlier deletes and resurrect those rows. The spec allows at most
