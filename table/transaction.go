@@ -3069,8 +3069,8 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 	// Both are folded into the file's new DV, and what it replaces is removed
 	// below. Without this a second delete on the same file would write a
 	// second live DV (buildDVIndex rejects it) or bring the legacy deletes'
-	// rows back. Everything is read before the scan below starts, so an error
-	// here leaks none of its workers or buffers.
+	// rows back. The scan below starts only once its records are read, so an
+	// error anywhere before that leaks none of its workers or buffers.
 	var (
 		existingDVs       map[string]iceberg.DataFile
 		existingDVBitmaps map[string]*dv.RoaringPositionBitmap
@@ -3337,64 +3337,69 @@ func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs
 		return nil, err
 	}
 
-	deletesPerFile, err := readAllDeleteFiles(ctx, fs, tasks, concurrency)
-	if err != nil {
-		// readAllDeleteFiles can return a partially-populated map alongside
-		// the error if some goroutines completed before the failure.
-		releasePerFilePosDeletes(deletesPerFile)
+	// Nothing is read and no worker starts until the records are first ranged, so a caller that fails before reading
+	// them (or never reads them) leaks nothing.
+	return func(yield func(arrow.RecordBatch, error) bool) {
+		deletesPerFile, err := readAllDeleteFiles(ctx, fs, tasks, concurrency)
+		if err != nil {
+			// readAllDeleteFiles can return a partially-populated map alongside
+			// the error if some goroutines completed before the failure.
+			releasePerFilePosDeletes(deletesPerFile)
+			yield(nil, err)
 
-		return nil, err
-	}
-
-	extSet := substrait.NewExtensionSet()
-
-	ctx, cancel := context.WithCancelCause(exprs.WithExtensionIDSet(ctx, extSet))
-	taskChan := make(chan tblutils.Enumerated[FileScanTask], len(tasks))
-
-	numWorkers := min(concurrency, len(tasks))
-	records := make(chan enumeratedRecord, numWorkers)
-
-	var wg sync.WaitGroup
-	wg.Add(numWorkers)
-	for range numWorkers {
-		go func() {
-			defer wg.Done()
-			sink := newRecordSink(records)
-			for {
-				if err := sink.reserve(ctx); err != nil {
-					return
-				}
-				select {
-				case <-ctx.Done():
-					return
-				case task, ok := <-taskChan:
-					if !ok {
-						return
-					}
-
-					if err := scanner.producePosDeletesFromTask(ctx, task, deletesPerFile[task.Value.File.FilePath()], sink, invariants); err != nil {
-						cancel(err)
-
-						return
-					}
-				}
-			}
-		}()
-	}
-
-	go func() {
-		for i, t := range tasks {
-			taskChan <- tblutils.Enumerated[FileScanTask]{
-				Value: t, Index: i, Last: i == len(tasks)-1,
-			}
+			return
 		}
-		close(taskChan)
 
-		wg.Wait()
-		close(records)
-	}()
+		extSet := substrait.NewExtensionSet()
 
-	return createIterator(ctx, uint(numWorkers), records, deletesPerFile, cancel, scanner.rowLimit), nil
+		ctx, cancel := context.WithCancelCause(exprs.WithExtensionIDSet(ctx, extSet))
+		taskChan := make(chan tblutils.Enumerated[FileScanTask], len(tasks))
+
+		numWorkers := min(concurrency, len(tasks))
+		records := make(chan enumeratedRecord, numWorkers)
+
+		var wg sync.WaitGroup
+		wg.Add(numWorkers)
+		for range numWorkers {
+			go func() {
+				defer wg.Done()
+				sink := newRecordSink(records)
+				for {
+					if err := sink.reserve(ctx); err != nil {
+						return
+					}
+					select {
+					case <-ctx.Done():
+						return
+					case task, ok := <-taskChan:
+						if !ok {
+							return
+						}
+
+						if err := scanner.producePosDeletesFromTask(ctx, task, deletesPerFile[task.Value.File.FilePath()], sink, invariants); err != nil {
+							cancel(err)
+
+							return
+						}
+					}
+				}
+			}()
+		}
+
+		go func() {
+			for i, t := range tasks {
+				taskChan <- tblutils.Enumerated[FileScanTask]{
+					Value: t, Index: i, Last: i == len(tasks)-1,
+				}
+			}
+			close(taskChan)
+
+			wg.Wait()
+			close(records)
+		}()
+
+		createIterator(ctx, uint(numWorkers), records, deletesPerFile, cancel, scanner.rowLimit)(yield)
+	}, nil
 }
 
 func (t *Transaction) Scan(opts ...ScanOption) (*Scan, error) {

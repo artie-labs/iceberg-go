@@ -2199,25 +2199,6 @@ type partitionContext struct {
 	specID        int32
 }
 
-// failPositionDeletes stops records unread and returns an iterator that yields only err. The records may come from a
-// scan whose workers are already running (see makePositionDeleteRecordsForFilter); starting and stopping the iterator
-// runs its cleanup, so they shut down and release their buffers instead of leaking.
-func failPositionDeletes(records iter.Seq2[arrow.RecordBatch, error], err error) iter.Seq2[iceberg.DataFile, error] {
-	if records != nil {
-		for record := range records {
-			if record != nil {
-				record.Release()
-			}
-
-			break
-		}
-	}
-
-	return func(yield func(iceberg.DataFile, error) bool) {
-		yield(nil, err)
-	}
-}
-
 func positionDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, meta *MetadataBuilder, partitionContextByFilePath map[string]partitionContext, args recordWritingArgs) (ret iter.Seq2[iceberg.DataFile, error]) {
 	if args.counter == nil {
 		args.counter = internal.Counter(0)
@@ -2232,20 +2213,26 @@ func positionDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 			default:
 				err = fmt.Errorf("error encountered during position delete file writing: %v", e)
 			}
-			ret = failPositionDeletes(args.itr, err)
+			ret = func(yield func(iceberg.DataFile, error) bool) {
+				yield(nil, err)
+			}
 		}
 	}()
 
 	latestMetadata, err := meta.Build()
 	if err != nil {
-		return failPositionDeletes(args.itr, err)
+		return func(yield func(iceberg.DataFile, error) bool) {
+			yield(nil, err)
+		}
 	}
 
 	// Check the specs the targeted data files were written under, not just the
 	// current one: a table that has since evolved past the unknown transform
 	// still reaches this path through its historic specs.
 	if err := checkNoUnknownTransformInSpecs(latestMetadata, partitionContextByFilePath); err != nil {
-		return failPositionDeletes(args.itr, err)
+		return func(yield func(iceberg.DataFile, error) bool) {
+			yield(nil, err)
+		}
 	}
 
 	// V3+ tables write deletion vectors via Puffin regardless of partitioning,
@@ -2269,9 +2256,11 @@ func positionDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 		cw := newConcurrentDataFileWriter(func(rootLocation string, fs iceio.WriteFileIO, meta *MetadataBuilder, props iceberg.Properties, opts ...dataFileWriterOption) (dataFileWriter, error) {
 			return newPositionDeleteWriter(rootLocation, fs, meta, props, opts...)
 		}, withSchemaSanitization(false))
-		nextCount, stopCount := iter.Pull(args.counter)
 		var readErr error
+		// The counter is pulled only once tasks is ranged: writeFiles can fail without ranging it, and a pull started
+		// up front would then never be stopped.
 		tasks := func(yield func(WriteTask) bool) {
+			nextCount, stopCount := iter.Pull(args.counter)
 			defer stopCount()
 
 			fileCount := 0
