@@ -3053,35 +3053,29 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 	if err != nil {
 		return nil, err
 	}
-
-	existingDeletes, err := t.positionDeletesForFilter(ctx, meta, filter, caseSensitive, concurrency)
-	if err != nil {
-		return nil, err
-	}
-	posDeleteRecIter, err := t.makePositionDeleteRecordsForFilter(ctx, fs, files, existingDeletes, filter, caseSensitive, concurrency)
-	if err != nil {
-		return nil, err
-	}
 	wfs, err := requireWriteFileIO(fs)
 	if err != nil {
 		return nil, err
 	}
-
-	partitionContextByFilePath := make(map[string]partitionContext, len(files))
-	for _, df := range files {
-		partitionContextByFilePath[df.FilePath()] = partitionContext{partitionData: df.Partition(), specID: df.SpecID()}
+	existingDeletes, err := t.positionDeletesForFilter(ctx, meta, filter, caseSensitive, concurrency)
+	if err != nil {
+		return nil, err
 	}
 
 	// V3 tables store deletes as deletion vectors, and the spec allows at most
 	// one DV per data file. A data file being partially deleted may already
-	// carry a DV from an earlier delete; those existing positions are folded
-	// into the new DV (the incremental deletes) and the superseded DVs are
-	// removed. Without this a second delete on the same file would write a
-	// second live DV, corrupting the table (buildDVIndex rejects it).
+	// carry a DV from an earlier delete, or, on a table upgraded from v2,
+	// Parquet position deletes that readers ignore once the file has a DV.
+	// Both are folded into the file's new DV, and what it replaces is removed
+	// below. Without this a second delete on the same file would write a
+	// second live DV (buildDVIndex rejects it) or bring the legacy deletes'
+	// rows back. Everything is read before the scan below starts, so an error
+	// here leaks none of its workers or buffers.
 	var (
 		existingDVs       map[string]iceberg.DataFile
 		existingDVBitmaps map[string]*dv.RoaringPositionBitmap
 	)
+	scanDeletes := existingDeletes
 	if meta.formatVersion >= 3 {
 		existingDVs, err = t.collectExistingDVs(fs, files)
 		if err != nil {
@@ -3097,15 +3091,33 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 			existingDVBitmaps[ref] = bitmap
 		}
 
-		// A table upgraded from v2 can still have Parquet position deletes on a file with no deletion vector yet.
-		// Readers ignore them once the file gets one, so they go into the new vector too.
 		legacy, err := legacyPositionDeleteBitmaps(ctx, fs, files, existingDeletes, concurrency)
 		if err != nil {
 			return nil, err
 		}
 		for ref, bitmap := range legacy {
-			existingDVBitmaps[ref] = bitmap
+			// The planner gives a file with a DV no Parquet deletes, so this
+			// only merges if that ever changes.
+			if seed, ok := existingDVBitmaps[ref]; ok {
+				seed.Or(bitmap)
+			} else {
+				existingDVBitmaps[ref] = bitmap
+			}
 		}
+		// The seeds already hold every deleted position, so the scan needn't
+		// read the legacy files a second time: a row it re-reports is already
+		// in its file's seed and adds nothing.
+		scanDeletes = nil
+	}
+
+	posDeleteRecIter, err := t.makePositionDeleteRecordsForFilter(ctx, fs, files, scanDeletes, filter, caseSensitive, concurrency)
+	if err != nil {
+		return nil, err
+	}
+
+	partitionContextByFilePath := make(map[string]partitionContext, len(files))
+	for _, df := range files {
+		partitionContextByFilePath[df.FilePath()] = partitionContext{partitionData: df.Partition(), specID: df.SpecID()}
 	}
 
 	posDeleteFiles := positionDeleteRecordsToDataFiles(ctx, t.tbl.Location(), meta, partitionContextByFilePath, recordWritingArgs{
@@ -3131,10 +3143,30 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 		}
 	}
 
-	// Supersede the old DVs only after the merged replacements are staged, so a
-	// write failure above leaves the existing DVs untouched.
-	for _, dvFile := range existingDVs {
-		updater.removeDeletionVector(dvFile)
+	// Supersede only what a new DV replaced, and only after the new DVs are
+	// staged, so a write failure above leaves the existing deletes untouched.
+	// A file whose matching rows were all deleted already gets no new DV and
+	// keeps its old deletes.
+	for ref, dvFile := range existingDVs {
+		if _, ok := seen[ref]; ok {
+			updater.removeDeletionVector(dvFile)
+		}
+	}
+	if meta.formatVersion >= 3 {
+		// A legacy file that targets only a data file with a new DV is fully
+		// absorbed, so it goes too; otherwise its positions would count twice in
+		// the snapshot totals. A partition-scoped one may still apply to other
+		// files and stays.
+		for ref, deletes := range existingDeletes {
+			if _, ok := seen[ref]; !ok {
+				continue
+			}
+			for _, deleteFile := range deletes {
+				if referencedDataFilePath(deleteFile) == ref {
+					updater.removeDeleteFile(deleteFile)
+				}
+			}
+		}
 	}
 
 	return referenced, nil
@@ -3221,7 +3253,7 @@ func legacyPositionDeleteBitmaps(ctx context.Context, fs io.IO, files []iceberg.
 // filter may match on the planning snapshot. A v2 merge-on-read delete applies them while it looks for matching rows, so
 // a row an earlier delete already removed doesn't get a second position delete: the read would be unchanged, but every
 // repeat counts again in the snapshot's total-position-deletes. A v3 delete folds them into the file's new deletion
-// vector, since readers ignore a file's Parquet position deletes once it has one. Rows removed by equality deletes still
+// vector instead, since readers ignore a file's Parquet position deletes once it has one. Rows removed by equality deletes still
 // match and get position deletes, which only inflates the totals.
 func (t *Transaction) positionDeletesForFilter(ctx context.Context, meta *MetadataBuilder, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) (map[string][]iceberg.DataFile, error) {
 	snapshot := t.planningSnapshot(meta)
