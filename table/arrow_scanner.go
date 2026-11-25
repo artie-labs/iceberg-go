@@ -2390,6 +2390,9 @@ func matchDeleteRows(ctx context.Context, matcher *deleteRowMatcher, tableSchema
 		if err != nil {
 			return nil, err
 		}
+		if mask == nil {
+			return nil, errors.New("delete row matcher returned no mask")
+		}
 		defer mask.Release()
 		if mask.Len() != int(r.NumRows()) {
 			return nil, fmt.Errorf("delete row matcher returned %d values for %d rows", mask.Len(), r.NumRows())

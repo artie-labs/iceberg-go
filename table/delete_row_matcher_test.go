@@ -78,6 +78,16 @@ func TestDeleteRowMatcher(t *testing.T) {
 			assert.Equal(t, []int64{2, 3}, idsInTable(t, tbl))
 		})
 	}
+	for _, formatVersion := range []string{"2", "3"} {
+		t.Run("deletes again from a file with deletes on v"+formatVersion, func(t *testing.T) {
+			tbl, err := newTable(t, formatVersion).Delete(ctx, superset, nil, table.WithDeleteRowMatcher([]string{"id", "data"}, pairs("1:a")))
+			require.NoError(t, err)
+			tbl, err = tbl.Delete(ctx, superset, nil, table.WithDeleteRowMatcher([]string{"id", "data"}, pairs("1:a", "4:b")))
+			require.NoError(t, err)
+			assert.Equal(t, []int64{2, 3}, idsInTable(t, tbl))
+			assert.Equal(t, "2", tbl.CurrentSnapshot().Summary.Properties["total-position-deletes"])
+		})
+	}
 	t.Run("keeps rows the matcher rejects", func(t *testing.T) {
 		// The filter alone would delete id 4 too.
 		tbl, err := newTable(t, "2").Delete(ctx, superset, nil, table.WithDeleteRowMatcher([]string{"id", "data"}, pairs("1:a")))

@@ -2291,7 +2291,7 @@ func (t *Transaction) AddFiles(ctx context.Context, filePaths []string, snapshot
 // An optional filter (see WithOverwriteFilter) determines which existing data to delete or rewrite:
 //   - If filter is nil or AlwaysTrue, all existing data files are deleted and replaced with new data.
 //   - If a filter is provided, it acts as a row-level predicate on existing data:
-//   - Files where all rows match the filter (strict match) are completely deleted
+//   - Files where all rows match the filter (strict match) are completely deleted, unless WithDeleteRowMatcher is set
 //   - Files where some rows match and others don't (partial match) are rewritten to keep only non-matching rows
 //   - Files where no rows match the filter are kept unchanged
 //
@@ -2357,7 +2357,7 @@ func WithOverwriteCaseInsensitive() OverwriteOption {
 // An optional filter (see WithOverwriteFilter) determines which existing data to delete or rewrite:
 //   - If filter is nil or AlwaysTrue, all existing data files are deleted and replaced with new data.
 //   - If a filter is provided, it acts as a row-level predicate on existing data:
-//   - Files where all rows match the filter (strict match) are completely deleted
+//   - Files where all rows match the filter (strict match) are completely deleted, unless WithDeleteRowMatcher is set
 //   - Files where some rows match and others don't (partial match) are rewritten to keep only non-matching rows
 //   - Files where no rows match the filter are kept unchanged
 //
@@ -2561,7 +2561,8 @@ type deleteOperation struct {
 }
 
 // DeleteRowMatcher reports, for each row of a batch the delete filter matched, whether to delete it. The batch holds
-// the matcher's columns and the filter's, under their schema names.
+// the matcher's columns and the filter's, under their schema names. It runs on several scan workers at once, so it
+// must be safe for concurrent use. The caller releases the returned mask; a null entry keeps the row.
 type DeleteRowMatcher func(ctx context.Context, batch arrow.RecordBatch) (*array.Boolean, error)
 
 type deleteRowMatcher struct {
@@ -2605,7 +2606,7 @@ func WithDeleteCaseInsensitive() DeleteOption {
 // Delete deletes records matching the provided filter.
 //
 // The provided filter acts as a row-level predicate on existing data:
-//   - Files where all rows match the filter (strict match) are completely deleted
+//   - Files where all rows match the filter (strict match) are completely deleted, unless WithDeleteRowMatcher is set
 //   - Files where some rows match and others don't (partial match) are rewritten to keep only non-matching rows
 //   - Files where no rows match the filter are kept unchanged
 //
