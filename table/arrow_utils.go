@@ -2306,30 +2306,17 @@ func positionDeleteRecordsToDataFilesDV(ctx context.Context, rootLocation string
 			return metadata.PartitionSpecByID(int(id))
 		})
 
-		// Seed the writer with any deletion vector the referenced data file
-		// already carries so its previously deleted positions survive into the
-		// merged DV. The scan that produced args.itr does NOT apply the existing
-		// DVs (makePositionDeleteRecordsForFilter attaches only Parquet position
-		// deletes, never DeletionVectorFiles), so the incoming batches may
-		// re-report positions already in the old DV; re-Setting them on top of
-		// the seed is a no-op
-		// because the bitmap is idempotent. The seed is what guarantees the old
-		// positions survive — do not remove it, or a second delete would drop
-		// the earlier deletes and resurrect those rows. The spec allows at most
-		// one DV per data file, so the caller supersedes the old DV once this
-		// merged one is written.
+		// args.existingDVs holds, per data file, every position already deleted:
+		// its current DV and any legacy Parquet position deletes from before a
+		// v2 to v3 upgrade. The scan that produced args.itr applies neither, so
+		// it re-reports those positions. A file's seed is loaded into the
+		// writer on its first position not already in the seed, so the merged
+		// DV keeps the earlier deletes (dropping them would resurrect those
+		// rows), and a file with nothing new gets no DV: the caller then keeps
+		// its existing deletes instead of superseding them. The spec allows at
+		// most one DV per data file.
 		hasEntries := false
-		for filePath, bitmap := range args.existingDVs {
-			pCtx, ok := partitionContextByFilePath[filePath]
-			if !ok {
-				yield(nil, fmt.Errorf("unexpected missing partition context for existing deletion vector path %s", filePath))
-
-				return
-			}
-			writer.Load(filePath, bitmap, pCtx.specID, pCtx.partitionData)
-			hasEntries = true
-		}
-
+		loaded := make(map[string]struct{}, len(args.existingDVs))
 		for batch, err := range args.itr {
 			if err != nil {
 				yield(nil, err)
@@ -2348,7 +2335,17 @@ func positionDeleteRecordsToDataFilesDV(ctx context.Context, rootLocation string
 
 					return
 				}
-				if err := writer.AddPosition(filePath, positions.Value(int(i)), pCtx.specID, pCtx.partitionData); err != nil {
+				position := positions.Value(int(i))
+				if seed, ok := args.existingDVs[filePath]; ok {
+					if position >= 0 && seed.Contains(uint64(position)) {
+						continue
+					}
+					if _, ok := loaded[filePath]; !ok {
+						writer.Load(filePath, seed, pCtx.specID, pCtx.partitionData)
+						loaded[filePath] = struct{}{}
+					}
+				}
+				if err := writer.AddPosition(filePath, position, pCtx.specID, pCtx.partitionData); err != nil {
 					yield(nil, err)
 
 					return
