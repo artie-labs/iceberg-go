@@ -883,9 +883,9 @@ func TestCheckNoUnknownTransformInSpecs(t *testing.T) {
 	})
 }
 
-// A delete's records come from a scan whose workers are already running, so returning an error without starting the
-// iterator would leave them blocked forever. Every error return must start and stop it, which runs its cleanup.
-func TestPositionDeleteRecordsToDataFilesStopsRecordsOnError(t *testing.T) {
+// An early error must leave the records unread: a delete's records come from a scan that starts only once they are
+// ranged (see makePositionDeleteRecordsForFilter), so reading them here would run that scan for nothing.
+func TestPositionDeleteRecordsToDataFilesLeavesRecordsUnreadOnError(t *testing.T) {
 	unknown, err := iceberg.ParseTransform("custom_transform[42]")
 	require.NoError(t, err)
 
@@ -904,17 +904,17 @@ func TestPositionDeleteRecordsToDataFilesStopsRecordsOnError(t *testing.T) {
 	require.NoError(t, builder.AddPartitionSpec(&unknownSpec, true))
 	require.NoError(t, builder.SetDefaultSpecID(-1))
 
-	stopped := false
+	started := false
 	records := func(yield func(arrow.RecordBatch, error) bool) {
-		defer func() { stopped = true }()
+		started = true
 	}
 
 	seq := positionDeleteRecordsToDataFiles(t.Context(), "mem://test", builder, nil, recordWritingArgs{
 		sc:  PositionalDeleteArrowSchema,
 		itr: records,
 	})
-	assert.True(t, stopped, "the records must be stopped before the error is returned")
 	for _, err := range seq {
 		require.ErrorIs(t, err, iceberg.ErrInvalidTransform)
 	}
+	assert.False(t, started, "the records must not be read")
 }
