@@ -34,7 +34,10 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/compute/exprs"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow/scalar"
 	"github.com/apache/iceberg-go"
 	iceberginternal "github.com/apache/iceberg-go/internal"
 	"github.com/apache/iceberg-go/io"
@@ -2814,7 +2817,8 @@ func (t *Transaction) classifyFilesForFilteredDeletions(ctx context.Context, fs 
 	return filesToDelete, filesWithPartialDeletes, fileSeqByPath, nil
 }
 
-// rewriteFilesWithFilter rewrites data files by preserving only rows that do NOT match the filter.
+// rewriteFilesWithFilter rewrites data files by preserving only rows the filter is not true for. A row the filter
+// evaluates to null on (a comparison on a null column) is kept, since Delete removes only rows the filter matches.
 // fileSeqByPath maps each file's path to its file_sequence_number from the source manifest entry,
 // used to synthesize _last_updated_sequence_number when the source row's value is null. The
 // filter binding and substrait conversion are computed once here and reused across every file.
@@ -2824,13 +2828,11 @@ func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, upda
 		return err
 	}
 
-	complementFilter := iceberg.NewNot(filter)
-
 	// Bind + convert the complement filter once for the whole rewrite. The
 	// per-batch filter function is reused across every record batch from
 	// every file in this rewrite — substrait conversion in particular is
 	// non-trivial so doing it inside the iterator loop wastes work.
-	postFilter, err := prepareBatchFilter(complementFilter, meta.CurrentSchema(), caseSensitive)
+	postFilter, err := preparePreserveBatchFilter(filter, meta.CurrentSchema(), caseSensitive)
 	if err != nil {
 		return err
 	}
@@ -2842,7 +2844,6 @@ func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, upda
 			fs:            fs,
 			originalFile:  originalFile,
 			fileSeqNum:    fileSeqByPath[originalFile.FilePath()],
-			filter:        complementFilter,
 			postFilter:    postFilter,
 			caseSensitive: caseSensitive,
 			commitUUID:    rewriteUUID,
@@ -2872,12 +2873,11 @@ type rewriteSingleFileArgs struct {
 	// manifest entry; required to synthesize _last_updated_sequence_number
 	// for rows whose value is null in the source file.
 	fileSeqNum *int64
-	// filter is the per-row complement (rows that survive the rewrite).
-	filter iceberg.BooleanExpression
-	// postFilter is the pre-bound, pre-substrait-converted version of
-	// filter. When preserveRowLineage applies it is the only place the
-	// filter is evaluated; the scanner's row filter is bypassed so
-	// _row_id positions stay correct.
+	// postFilter keeps the rows that survive the rewrite: those the delete
+	// filter is not true for. It is the only place the filter is evaluated.
+	// The scanner reads every row, unfiltered and unpruned, so a row the
+	// delete filter is null on is never dropped and _row_id positions stay
+	// correct.
 	postFilter    func(context.Context, arrow.RecordBatch) (arrow.RecordBatch, error)
 	caseSensitive bool
 	commitUUID    uuid.UUID
@@ -2907,26 +2907,11 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 	// number of the snapshot that last *logically* updated the row — for a
 	// pure CoW rewrite the surviving rows are unchanged, so they must keep
 	// their original value rather than inheriting the new commit's seq.
-	//
-	// When preserving lineage, the row filter must NOT be applied inside the
-	// scanner because _row_id synthesis depends on original file position. The
-	// filter is applied post-synthesis in the record iterator instead.
-	//
-	// Keep the real filter available to Parquet row-group pruning while the
-	// scanner's row filter stays AlwaysTrue. Pruning happens before rows are
-	// materialized, so _row_id synthesis still sees the original positions of
-	// every surviving row group and the post-synthesis filter remains correct.
 	_, originalFirstRowID, _, _, _ := iceberginternal.BorrowedDataFilePointers(args.originalFile)
 	preserveRowLineage := meta.formatVersion >= 3 && originalFirstRowID != nil
 	projectedSchema := meta.CurrentSchema()
 	var factoryOpts []writerFactoryOption
-	var rowGroupFilter iceberg.BooleanExpression
 	if preserveRowLineage {
-		rowGroupFilter, err = iceberg.BindExpr(meta.CurrentSchema(), args.filter, args.caseSensitive)
-		if err != nil {
-			return nil, fmt.Errorf("failed to bind row-group filter: %w", err)
-		}
-
 		projectedSchema = iceberg.SchemaWithRowLineage(projectedSchema)
 		factoryOpts = append(factoryOpts, withFactoryFileSchema(projectedSchema))
 		scanTask.FirstRowID = args.originalFile.FirstRowID()
@@ -2936,18 +2921,6 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 		// is non-null the existing per-row value wins, preserving the
 		// original update sequence across the rewrite.
 		scanTask.DataSequenceNumber = args.fileSeqNum
-	}
-
-	// When preserving row lineage, the bound scan-time filter is replaced
-	// with AlwaysTrue and the rebound version inside prepareBatchFilter is
-	// the one actually applied. Skip the wasted BindExpr in that case.
-	scanFilter := iceberg.BooleanExpression(iceberg.AlwaysTrue{})
-	if !preserveRowLineage {
-		boundFilter, err := iceberg.BindExpr(meta.CurrentSchema(), args.filter, args.caseSensitive)
-		if err != nil {
-			return nil, fmt.Errorf("failed to bind filter: %w", err)
-		}
-		scanFilter = boundFilter
 	}
 
 	builtMeta, err := meta.Build()
@@ -2960,8 +2933,7 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 		fs:              args.fs,
 		scanSchema:      meta.CurrentSchema(),
 		projectedSchema: projectedSchema,
-		boundRowFilter:  scanFilter,
-		rowGroupFilter:  rowGroupFilter,
+		boundRowFilter:  iceberg.AlwaysTrue{},
 		caseSensitive:   args.caseSensitive,
 		rowLimit:        -1, // No limit
 		concurrency:     args.concurrency,
@@ -2985,9 +2957,8 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 		}
 	}
 
-	// Wrap the iterator to release records after consumption.
-	// When preserving row lineage, also apply the (pre-bound) filter here
-	// post-synthesis so _row_id positions stay correct.
+	// Wrap the iterator to release records after consumption, keeping only
+	// the rows that survive the delete (after _row_id synthesis).
 	releaseIter := func(yield func(arrow.RecordBatch, error) bool) {
 		for rec, err := range recordIter {
 			if err != nil {
@@ -2996,18 +2967,16 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 				return
 			}
 
-			if preserveRowLineage {
-				rec, err = args.postFilter(ctx, rec)
-				if err != nil {
-					yield(nil, err)
+			rec, err = args.postFilter(ctx, rec)
+			if err != nil {
+				yield(nil, err)
 
-					return
-				}
-				if rec.NumRows() == 0 {
-					rec.Release()
+				return
+			}
+			if rec.NumRows() == 0 {
+				rec.Release()
 
-					continue
-				}
+				continue
 			}
 
 			if !yield(rec, nil) {
@@ -3565,6 +3534,95 @@ func (s *StagedTable) Scan(opts ...ScanOption) *Scan {
 // indices, so callers must pass the bound filter's schema verbatim — extra
 // trailing columns (e.g. row-lineage metadata) are tolerated only because
 // they live at indices past the filter's referenced fields.
+// preparePreserveBatchFilter returns a per-batch function keeping the rows filter is not true for: rows it is false
+// or null on. Filtering on iceberg.NewNot(filter) would drop the null rows, since NOT null is null.
+func preparePreserveBatchFilter(filter iceberg.BooleanExpression, schema *iceberg.Schema, caseSensitive bool) (func(context.Context, arrow.RecordBatch) (arrow.RecordBatch, error), error) {
+	keepNone := func(_ context.Context, rec arrow.RecordBatch) (arrow.RecordBatch, error) {
+		defer rec.Release()
+
+		return rec.NewSlice(0, 0), nil
+	}
+	keepAll := func(_ context.Context, rec arrow.RecordBatch) (arrow.RecordBatch, error) {
+		return rec, nil
+	}
+	if filter == nil || filter.Equals(iceberg.AlwaysTrue{}) {
+		return keepNone, nil
+	}
+
+	bound, err := iceberg.BindExpr(schema, filter, caseSensitive)
+	if err != nil {
+		return nil, fmt.Errorf("preparePreserveBatchFilter: bind expression: %w", err)
+	}
+	if bound == nil || bound.Equals(iceberg.AlwaysTrue{}) {
+		return keepNone, nil
+	}
+	if bound.Equals(iceberg.AlwaysFalse{}) {
+		return keepAll, nil
+	}
+
+	extSet, substraitFilter, err := substrait.ConvertExpr(schema, bound, caseSensitive)
+	if err != nil {
+		return nil, fmt.Errorf("preparePreserveBatchFilter: convert expression: %w", err)
+	}
+
+	return func(ctx context.Context, rec arrow.RecordBatch) (arrow.RecordBatch, error) {
+		defer rec.Release()
+
+		ctx = exprs.WithExtensionIDSet(ctx, exprs.NewExtensionSetDefault(*extSet))
+		input := compute.NewDatumWithoutOwning(rec)
+		matched, err := exprs.ExecuteScalarExpression(ctx, rec.Schema(), substraitFilter, input)
+		if err != nil {
+			return nil, err
+		}
+		defer matched.Release()
+
+		keep, err := notTrueMask(matched, int(rec.NumRows()))
+		if err != nil {
+			return nil, err
+		}
+		defer keep.Release()
+
+		result, err := compute.Filter(ctx, input, compute.NewDatumWithoutOwning(keep), *compute.DefaultFilterOptions())
+		if err != nil {
+			return nil, err
+		}
+
+		return result.(*compute.RecordDatum).Value, nil
+	}, nil
+}
+
+// notTrueMask returns a mask that is true where matched is false or null.
+func notTrueMask(matched compute.Datum, numRows int) (*array.Boolean, error) {
+	builder := array.NewBooleanBuilder(memory.DefaultAllocator)
+	defer builder.Release()
+	builder.Reserve(numRows)
+
+	switch matched := matched.(type) {
+	case *compute.ArrayDatum:
+		values, ok := matched.MakeArray().(*array.Boolean)
+		if !ok {
+			return nil, fmt.Errorf("delete filter returned %s, not boolean", matched.Type())
+		}
+		defer values.Release()
+		for i := range values.Len() {
+			builder.UnsafeAppend(!values.IsValid(i) || !values.Value(i))
+		}
+	case *compute.ScalarDatum:
+		value, ok := matched.Value.(*scalar.Boolean)
+		if !ok {
+			return nil, fmt.Errorf("delete filter returned %s, not boolean", matched.Type())
+		}
+		keep := !value.IsValid() || !value.Value
+		for range numRows {
+			builder.UnsafeAppend(keep)
+		}
+	default:
+		return nil, fmt.Errorf("delete filter returned unexpected %s datum", matched.Kind())
+	}
+
+	return builder.NewBooleanArray(), nil
+}
+
 func prepareBatchFilter(filter iceberg.BooleanExpression, schema *iceberg.Schema, caseSensitive bool) (func(context.Context, arrow.RecordBatch) (arrow.RecordBatch, error), error) {
 	if filter == nil || filter.Equals(iceberg.AlwaysTrue{}) {
 		return func(_ context.Context, rec arrow.RecordBatch) (arrow.RecordBatch, error) {
