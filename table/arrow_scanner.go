@@ -1247,6 +1247,9 @@ type arrowScan struct {
 	useLargeTypes bool
 	concurrency   int
 
+	// deleteMatcher, when set, narrows the rows a merge-on-read delete scan reports; see WithDeleteRowMatcher.
+	deleteMatcher *deleteRowMatcher
+
 	// arrowBatchSize, when positive, overrides the table's
 	// read.parquet.batch-size property for this scan's reads.
 	arrowBatchSize int
@@ -2357,6 +2360,9 @@ func (as *arrowScan) producePosDeletesFromTask(ctx context.Context, task tblutil
 	if filterFunc != nil {
 		pipeline = append(pipeline, filterFunc)
 	}
+	if as.deleteMatcher != nil {
+		pipeline = append(pipeline, matchDeleteRows(ctx, as.deleteMatcher, as.projectedSchema, enrichedIcebergSchema, as.useLargeTypes))
+	}
 	pipeline = append(pipeline, func(r arrow.RecordBatch) (arrow.RecordBatch, error) {
 		defer r.Release()
 
@@ -2366,6 +2372,31 @@ func (as *arrowScan) producePosDeletesFromTask(ctx context.Context, task tblutil
 	err = as.processRecordsWithPlans(ctx, task, iceSchema, as.boundRowFilter, rdr, colIndices, pipeline, posSource, sink, filterPlans)
 
 	return err
+}
+
+// matchDeleteRows keeps the rows matcher selects. The matcher sees them in the table's schema, as tableSchema projects
+// it, not in the data file's: names, promoted types and columns the file lacks (as nulls) all follow the table.
+func matchDeleteRows(ctx context.Context, matcher *deleteRowMatcher, tableSchema, fileSchema *iceberg.Schema, useLargeTypes bool) recProcessFn {
+	return func(r arrow.RecordBatch) (arrow.RecordBatch, error) {
+		defer r.Release()
+
+		asTable, err := ToRequestedSchema(ctx, tableSchema, fileSchema, r, SchemaOptions{IncludeFieldIDs: true, UseLargeTypes: useLargeTypes})
+		if err != nil {
+			return nil, err
+		}
+		defer asTable.Release()
+
+		mask, err := matcher.match(ctx, asTable)
+		if err != nil {
+			return nil, err
+		}
+		defer mask.Release()
+		if mask.Len() != int(r.NumRows()) {
+			return nil, fmt.Errorf("delete row matcher returned %d values for %d rows", mask.Len(), r.NumRows())
+		}
+
+		return compute.FilterRecordBatch(ctx, r, mask, compute.DefaultFilterOptions())
+	}
 }
 
 func createIterator(ctx context.Context, numWorkers uint, records <-chan enumeratedRecord, deletesPerFile perFilePosDeletes, cancel context.CancelCauseFunc, rowLimit int64) iter.Seq2[arrow.RecordBatch, error] {
