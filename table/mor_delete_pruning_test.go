@@ -19,6 +19,7 @@ package table_test
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -558,5 +559,78 @@ func TestMergeOnReadDeleteV3StatsCountEachDeletedRowOnce(t *testing.T) {
 		deletes, files := totals(tbl)
 		assert.Equal(t, "1", deletes)
 		assert.Equal(t, "1", files)
+		summary := tbl.CurrentSnapshot().Summary.Properties
+		assert.Empty(t, summary["added-delete-files"], "an unchanged vector must not be rewritten")
+		assert.Empty(t, summary["removed-delete-files"], "an unchanged vector must not be superseded")
+	}
+}
+
+// TestMergeOnReadDeleteV3ReplacesOnlyChangedFilesDeletes covers one v3 delete across two data files: file A gets a new
+// deleted row and file B only re-matches a row it already deleted. A's earlier deletes are replaced by its new vector;
+// B's stay as they are.
+func TestMergeOnReadDeleteV3ReplacesOnlyChangedFilesDeletes(t *testing.T) {
+	ctx := context.Background()
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "data", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	// appendFile appends ids from..from+4 as one data file.
+	appendFile := func(tbl *table.Table, from int64) *table.Table {
+		rows := make([]string, 0, 5)
+		for id := from; id < from+5; id++ {
+			rows = append(rows, fmt.Sprintf(`{"id":%d,"data":"x"}`, id))
+		}
+		data, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{"[" + strings.Join(rows, ",") + "]"})
+		require.NoError(t, err)
+		defer data.Release()
+		tbl, err = tbl.Append(ctx, array.NewTableReader(data, -1), nil)
+		require.NoError(t, err)
+
+		return tbl
+	}
+	// twoFiles returns a table with file A (ids 1-5) and file B (ids 6-10), and ids 2 and 7 deleted one at a time.
+	twoFiles := func(props iceberg.Properties) *table.Table {
+		tbl := appendFile(appendFile(newMergeOnReadTestTableProps(t, props), 1), 6)
+		for _, id := range []int64{2, 7} {
+			var err error
+			tbl, err = tbl.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), id), nil)
+			require.NoError(t, err)
+		}
+
+		return tbl
+	}
+	// Re-matches 2 and 7, and newly deletes 3 in file A.
+	filter := iceberg.IsIn(iceberg.Reference("id"), int64(2), int64(3), int64(7))
+
+	{
+		// Deletion vectors: A's is rewritten as {2, 3}, B's {7} stays.
+		tbl, err := twoFiles(iceberg.Properties{table.PropertyFormatVersion: "3"}).Delete(ctx, filter, nil)
+		require.NoError(t, err)
+		assert.Equal(t, []int64{1, 4, 5, 6, 8, 9, 10}, idsInTable(t, tbl))
+		summary := tbl.CurrentSnapshot().Summary.Properties
+		assert.Equal(t, "1", summary["added-delete-files"])
+		assert.Equal(t, "1", summary["removed-delete-files"])
+		assert.Equal(t, "3", summary["total-position-deletes"])
+		assert.Equal(t, "2", summary["total-delete-files"])
+	}
+	{
+		// File-scoped legacy Parquet deletes after a v2 to v3 upgrade: A's is absorbed and removed, B's stays.
+		tbl := twoFiles(iceberg.Properties{
+			table.PropertyFormatVersion:                      "2",
+			table.MetricsModeColumnConfPrefix + ".file_path": "full",
+		})
+		txn := tbl.NewTransaction()
+		require.NoError(t, txn.UpgradeFormatVersion(3))
+		tbl, err := txn.Commit(ctx)
+		require.NoError(t, err)
+
+		tbl, err = tbl.Delete(ctx, filter, nil)
+		require.NoError(t, err)
+		assert.Equal(t, []int64{1, 4, 5, 6, 8, 9, 10}, idsInTable(t, tbl))
+		summary := tbl.CurrentSnapshot().Summary.Properties
+		assert.Equal(t, "1", summary["added-delete-files"])
+		assert.Equal(t, "1", summary["removed-delete-files"])
+		assert.Equal(t, "3", summary["total-position-deletes"])
+		assert.Equal(t, "2", summary["total-delete-files"])
 	}
 }

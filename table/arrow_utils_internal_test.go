@@ -23,6 +23,7 @@ import (
 	"math"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet"
@@ -880,4 +881,40 @@ func TestCheckNoUnknownTransformInSpecs(t *testing.T) {
 		}
 		require.NoError(t, checkNoUnknownTransformInSpecs(meta, files))
 	})
+}
+
+// A delete's records come from a scan whose workers are already running, so returning an error without starting the
+// iterator would leave them blocked forever. Every error return must start and stop it, which runs its cleanup.
+func TestPositionDeleteRecordsToDataFilesStopsRecordsOnError(t *testing.T) {
+	unknown, err := iceberg.ParseTransform("custom_transform[42]")
+	require.NoError(t, err)
+
+	tableSchema := schema()
+	unknownSpec := iceberg.NewPartitionSpec(iceberg.PartitionField{
+		SourceIDs: []int{2}, FieldID: 1000, Name: "y_custom", Transform: unknown,
+	})
+	builder, err := NewMetadataBuilder(2)
+	require.NoError(t, err)
+	require.NoError(t, builder.SetLoc("s3://bucket/test/location"))
+	require.NoError(t, builder.AddSchema(&tableSchema))
+	require.NoError(t, builder.SetCurrentSchemaID(-1))
+	sortOrder := sortOrder()
+	require.NoError(t, builder.AddSortOrder(&sortOrder))
+	require.NoError(t, builder.SetDefaultSortOrderID(-1))
+	require.NoError(t, builder.AddPartitionSpec(&unknownSpec, true))
+	require.NoError(t, builder.SetDefaultSpecID(-1))
+
+	stopped := false
+	records := func(yield func(arrow.RecordBatch, error) bool) {
+		defer func() { stopped = true }()
+	}
+
+	seq := positionDeleteRecordsToDataFiles(t.Context(), "mem://test", builder, nil, recordWritingArgs{
+		sc:  PositionalDeleteArrowSchema,
+		itr: records,
+	})
+	assert.True(t, stopped, "the records must be stopped before the error is returned")
+	for _, err := range seq {
+		require.ErrorIs(t, err, iceberg.ErrInvalidTransform)
+	}
 }
