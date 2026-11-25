@@ -20,6 +20,7 @@ package table_test
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -633,4 +634,36 @@ func TestMergeOnReadDeleteV3ReplacesOnlyChangedFilesDeletes(t *testing.T) {
 		assert.Equal(t, "3", summary["total-position-deletes"])
 		assert.Equal(t, "2", summary["total-delete-files"])
 	}
+}
+
+// A merge-on-read delete reads the data files' existing position deletes only once it starts writing, so a delete
+// file it can't read must still fail the delete instead of being skipped.
+func TestMergeOnReadDeleteFailsOnUnreadablePositionDeletes(t *testing.T) {
+	ctx := context.Background()
+	tbl := newMergeOnReadTestTable(t)
+
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "data", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	data, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{
+		`[{"id":1,"data":"a"},{"id":2,"data":"b"},{"id":3,"data":"c"}]`,
+	})
+	require.NoError(t, err)
+	defer data.Release()
+
+	tbl, err = tbl.Append(ctx, array.NewTableReader(data, -1), nil)
+	require.NoError(t, err)
+	tbl, err = tbl.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), int64(1)), nil)
+	require.NoError(t, err)
+
+	scan := tbl.Scan()
+	tasks, err := scan.PlanFiles(ctx)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	require.Len(t, tasks[0].DeleteFiles, 1)
+	require.NoError(t, os.Remove(strings.TrimPrefix(tasks[0].DeleteFiles[0].FilePath(), "file://")))
+
+	_, err = tbl.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), int64(2)), nil)
+	require.Error(t, err)
 }

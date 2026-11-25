@@ -21,7 +21,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"math"
+	"runtime"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -913,8 +915,43 @@ func TestPositionDeleteRecordsToDataFilesLeavesRecordsUnreadOnError(t *testing.T
 		sc:  PositionalDeleteArrowSchema,
 		itr: records,
 	})
+	var errs []error
 	for _, err := range seq {
-		require.ErrorIs(t, err, iceberg.ErrInvalidTransform)
+		errs = append(errs, err)
 	}
+	require.Len(t, errs, 1)
+	require.ErrorIs(t, errs[0], iceberg.ErrInvalidTransform)
 	assert.False(t, started, "the records must not be read")
+}
+
+// writeFiles can fail creating its writer before it ranges its tasks. Nothing may be left running then: the records
+// stay unread, so a merge-on-read delete's scan never starts, and the file counter is never pulled, so no pull is left
+// unstopped.
+func TestPositionDeleteRecordsToDataFilesWriterErrorLeavesNothingRunning(t *testing.T) {
+	builder := newPositionDeleteUnpartitionedMetadata(t, 2)
+	require.NoError(t, builder.SetProperties(iceberg.Properties{WriteFormatDefaultKey: "bogus"}))
+
+	started := false
+	records := func(yield func(arrow.RecordBatch, error) bool) {
+		started = true
+	}
+
+	before := runtime.NumGoroutine()
+	var errs []error
+	for _, err := range positionDeleteRecordsToDataFiles(t.Context(), "file:///pos-delete-test", builder,
+		unpartitionedContexts("file:///pos-delete-test/data/a.parquet"), recordWritingArgs{
+			sc:  PositionalDeleteArrowSchema,
+			itr: records,
+		}) {
+		errs = append(errs, err)
+	}
+	require.Len(t, errs, 1)
+	require.ErrorContains(t, errs[0], "bogus")
+	assert.False(t, started, "the records must not be read")
+	// Polled by hand: assert.Eventually runs its condition on a goroutine of its own.
+	after := runtime.NumGoroutine()
+	for deadline := time.Now().Add(time.Second); after > before && time.Now().Before(deadline); after = runtime.NumGoroutine() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	assert.LessOrEqual(t, after, before, "no goroutine may be left running")
 }
