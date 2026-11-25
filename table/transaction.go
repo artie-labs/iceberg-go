@@ -38,6 +38,7 @@ import (
 	"github.com/apache/iceberg-go"
 	iceberginternal "github.com/apache/iceberg-go/internal"
 	"github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/metrics"
 	"github.com/apache/iceberg-go/table/dv"
 	tblutils "github.com/apache/iceberg-go/table/internal"
 	"github.com/apache/iceberg-go/table/substrait"
@@ -3053,7 +3054,11 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 		return nil, err
 	}
 
-	posDeleteRecIter, err := t.makePositionDeleteRecordsForFilter(ctx, fs, files, filter, caseSensitive, concurrency)
+	existingDeletes, err := t.positionDeletesForFilter(ctx, meta, filter, caseSensitive, concurrency)
+	if err != nil {
+		return nil, err
+	}
+	posDeleteRecIter, err := t.makePositionDeleteRecordsForFilter(ctx, fs, files, existingDeletes, filter, caseSensitive, concurrency)
 	if err != nil {
 		return nil, err
 	}
@@ -3089,6 +3094,16 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 			if err != nil {
 				return nil, fmt.Errorf("failed to read existing deletion vector for %s: %w", ref, err)
 			}
+			existingDVBitmaps[ref] = bitmap
+		}
+
+		// A table upgraded from v2 can still have Parquet position deletes on a file with no deletion vector yet.
+		// Readers ignore them once the file gets one, so they go into the new vector too.
+		legacy, err := legacyPositionDeleteBitmaps(ctx, fs, files, existingDeletes, concurrency)
+		if err != nil {
+			return nil, err
+		}
+		for ref, bitmap := range legacy {
 			existingDVBitmaps[ref] = bitmap
 		}
 	}
@@ -3168,16 +3183,53 @@ func (t *Transaction) collectExistingDVs(fs io.IO, files []iceberg.DataFile) (ma
 	return result, nil
 }
 
-// positionDeletesForFilter returns, by data file path, the position delete files that apply to each data file the
-// filter may match on the planning snapshot. A merge-on-read delete applies them while it looks for matching rows, so a
-// row an earlier delete already removed doesn't get a second position delete: the read would be unchanged, but every
-// repeat counts again in the snapshot's total-position-deletes.
+// legacyPositionDeleteBitmaps reads the Parquet position deletes in existingDeletes that apply to files into one bitmap
+// per data file path.
+func legacyPositionDeleteBitmaps(ctx context.Context, fs io.IO, files []iceberg.DataFile, existingDeletes map[string][]iceberg.DataFile, concurrency int) (map[string]*dv.RoaringPositionBitmap, error) {
+	var tasks []FileScanTask
+	for _, f := range files {
+		if deletes := existingDeletes[f.FilePath()]; len(deletes) > 0 {
+			tasks = append(tasks, FileScanTask{File: f, DeleteFiles: deletes})
+		}
+	}
+	if len(tasks) == 0 {
+		return nil, nil
+	}
+
+	deletesPerFile, err := readAllDeleteFiles(ctx, fs, tasks, concurrency)
+	defer releasePerFilePosDeletes(deletesPerFile)
+	if err != nil {
+		return nil, err
+	}
+	bitmaps := make(map[string]*dv.RoaringPositionBitmap, len(deletesPerFile))
+	for path, deletes := range deletesPerFile {
+		positions, err := collectPosDeletePositions(deletes)
+		if err != nil {
+			return nil, err
+		}
+		bitmap := dv.NewRoaringPositionBitmap()
+		for position := range positions {
+			bitmap.Set(uint64(position))
+		}
+		bitmaps[path] = bitmap
+	}
+
+	return bitmaps, nil
+}
+
+// positionDeletesForFilter returns, by data file path, the Parquet position delete files that apply to each data file the
+// filter may match on the planning snapshot. A v2 merge-on-read delete applies them while it looks for matching rows, so
+// a row an earlier delete already removed doesn't get a second position delete: the read would be unchanged, but every
+// repeat counts again in the snapshot's total-position-deletes. A v3 delete folds them into the file's new deletion
+// vector, since readers ignore a file's Parquet position deletes once it has one. Rows removed by equality deletes still
+// match and get position deletes, which only inflates the totals.
 func (t *Transaction) positionDeletesForFilter(ctx context.Context, meta *MetadataBuilder, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) (map[string][]iceberg.DataFile, error) {
 	snapshot := t.planningSnapshot(meta)
 	if snapshot == nil {
 		return nil, nil
 	}
-	scan, err := t.Scan(WithSnapshotID(snapshot.SnapshotID), WithRowFilter(filter), WithCaseSensitive(caseSensitive), WithMaxConcurrency(concurrency))
+	// This planning pass is internal to the delete, so it reports no scan metrics.
+	scan, err := t.Scan(WithSnapshotID(snapshot.SnapshotID), WithRowFilter(filter), WithCaseSensitive(caseSensitive), WithMaxConcurrency(concurrency), WithReporter(metrics.NopReporter{}))
 	if err != nil {
 		return nil, err
 	}
@@ -3198,13 +3250,8 @@ func (t *Transaction) positionDeletesForFilter(ctx context.Context, meta *Metada
 	return deletes, nil
 }
 
-func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs io.IO, files []iceberg.DataFile, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) (seq2 iter.Seq2[arrow.RecordBatch, error], err error) {
+func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs io.IO, files []iceberg.DataFile, existingDeletes map[string][]iceberg.DataFile, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) (seq2 iter.Seq2[arrow.RecordBatch, error], err error) {
 	meta, err := t.txnMeta()
-	if err != nil {
-		return nil, err
-	}
-
-	existingDeletes, err := t.positionDeletesForFilter(ctx, meta, filter, caseSensitive, concurrency)
 	if err != nil {
 		return nil, err
 	}
