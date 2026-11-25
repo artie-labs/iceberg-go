@@ -2026,10 +2026,12 @@ type recordWritingArgs struct {
 	// channel capacity; non-positive uses the default (see
 	// rollingDataWriterQueueCapacity).
 	recordBatchBufferSize int
-	// existingDVs maps a data file path to the positions already recorded in
-	// its current deletion vector. On the v3 DV write path these are folded
-	// into the newly written DV so a data file that already had a DV ends up
-	// with a single merged vector (the caller removes the superseded one).
+	// existingDVs maps a data file path to the positions already deleted from
+	// it: its current deletion vector plus any legacy Parquet position deletes
+	// from before a v2 to v3 upgrade. On the v3 DV write path a file's seed is
+	// folded into its new DV only once the file gets a position not already in
+	// the seed, so a file with nothing new gets no DV and the caller keeps its
+	// existing deletes; otherwise the caller removes what the new DV replaces.
 	existingDVs map[string]*dv.RoaringPositionBitmap
 }
 
@@ -2197,6 +2199,25 @@ type partitionContext struct {
 	specID        int32
 }
 
+// failPositionDeletes stops records unread and returns an iterator that yields only err. The records may come from a
+// scan whose workers are already running (see makePositionDeleteRecordsForFilter); starting and stopping the iterator
+// runs its cleanup, so they shut down and release their buffers instead of leaking.
+func failPositionDeletes(records iter.Seq2[arrow.RecordBatch, error], err error) iter.Seq2[iceberg.DataFile, error] {
+	if records != nil {
+		for record := range records {
+			if record != nil {
+				record.Release()
+			}
+
+			break
+		}
+	}
+
+	return func(yield func(iceberg.DataFile, error) bool) {
+		yield(nil, err)
+	}
+}
+
 func positionDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, meta *MetadataBuilder, partitionContextByFilePath map[string]partitionContext, args recordWritingArgs) (ret iter.Seq2[iceberg.DataFile, error]) {
 	if args.counter == nil {
 		args.counter = internal.Counter(0)
@@ -2211,26 +2232,20 @@ func positionDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 			default:
 				err = fmt.Errorf("error encountered during position delete file writing: %v", e)
 			}
-			ret = func(yield func(iceberg.DataFile, error) bool) {
-				yield(nil, err)
-			}
+			ret = failPositionDeletes(args.itr, err)
 		}
 	}()
 
 	latestMetadata, err := meta.Build()
 	if err != nil {
-		return func(yield func(iceberg.DataFile, error) bool) {
-			yield(nil, err)
-		}
+		return failPositionDeletes(args.itr, err)
 	}
 
 	// Check the specs the targeted data files were written under, not just the
 	// current one: a table that has since evolved past the unknown transform
 	// still reaches this path through its historic specs.
 	if err := checkNoUnknownTransformInSpecs(latestMetadata, partitionContextByFilePath); err != nil {
-		return func(yield func(iceberg.DataFile, error) bool) {
-			yield(nil, err)
-		}
+		return failPositionDeletes(args.itr, err)
 	}
 
 	// V3+ tables write deletion vectors via Puffin regardless of partitioning,
