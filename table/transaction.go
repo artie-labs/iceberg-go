@@ -3168,8 +3168,43 @@ func (t *Transaction) collectExistingDVs(fs io.IO, files []iceberg.DataFile) (ma
 	return result, nil
 }
 
+// positionDeletesForFilter returns, by data file path, the position delete files that apply to each data file the
+// filter may match on the planning snapshot. A merge-on-read delete applies them while it looks for matching rows, so a
+// row an earlier delete already removed doesn't get a second position delete: the read would be unchanged, but every
+// repeat counts again in the snapshot's total-position-deletes.
+func (t *Transaction) positionDeletesForFilter(ctx context.Context, meta *MetadataBuilder, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) (map[string][]iceberg.DataFile, error) {
+	snapshot := t.planningSnapshot(meta)
+	if snapshot == nil {
+		return nil, nil
+	}
+	scan, err := t.Scan(WithSnapshotID(snapshot.SnapshotID), WithRowFilter(filter), WithCaseSensitive(caseSensitive), WithMaxConcurrency(concurrency))
+	if err != nil {
+		return nil, err
+	}
+	// Bind the filter to the current schema, as the delete does: it may name a column added after snapshot was written.
+	currentSchema := false
+	scan.useSnapshotSchema = &currentSchema
+	planned, err := scan.PlanFiles(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to plan existing position deletes: %w", err)
+	}
+	deletes := make(map[string][]iceberg.DataFile, len(planned))
+	for _, task := range planned {
+		if len(task.DeleteFiles) > 0 {
+			deletes[task.File.FilePath()] = task.DeleteFiles
+		}
+	}
+
+	return deletes, nil
+}
+
 func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs io.IO, files []iceberg.DataFile, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) (seq2 iter.Seq2[arrow.RecordBatch, error], err error) {
 	meta, err := t.txnMeta()
+	if err != nil {
+		return nil, err
+	}
+
+	existingDeletes, err := t.positionDeletesForFilter(ctx, meta, filter, caseSensitive, concurrency)
 	if err != nil {
 		return nil, err
 	}
@@ -3177,9 +3212,10 @@ func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs
 	tasks := make([]FileScanTask, 0, len(files))
 	for _, f := range files {
 		tasks = append(tasks, FileScanTask{
-			File:   f,
-			Start:  0,
-			Length: f.FileSizeBytes(),
+			File:        f,
+			DeleteFiles: existingDeletes[f.FilePath()],
+			Start:       0,
+			Length:      f.FileSizeBytes(),
 		})
 	}
 

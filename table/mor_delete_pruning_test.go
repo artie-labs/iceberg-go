@@ -365,3 +365,37 @@ func TestMergeOnReadDeleteOnColumnAddedLater(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, idsInTable(t, tbl))
 }
+
+// TestMergeOnReadDeleteSkipsAlreadyDeletedRows guards against a v2 merge-on-read DELETE writing a second position delete
+// for a row an earlier delete already removed. Reads stay correct either way, but every repeat counts again in the
+// snapshot's total-position-deletes, so a table that deletes the same keys over and over reports far more deletes
+// than rows and any row count derived from the totals drops toward zero.
+func TestMergeOnReadDeleteSkipsAlreadyDeletedRows(t *testing.T) {
+	ctx := context.Background()
+	tbl := newMergeOnReadTestTable(t)
+
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "data", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	data, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{
+		`[{"id":1,"data":"a"},{"id":2,"data":"b"},{"id":3,"data":"c"},{"id":4,"data":"d"},{"id":5,"data":"e"}]`,
+	})
+	require.NoError(t, err)
+	defer data.Release()
+
+	tbl, err = tbl.Append(ctx, array.NewTableReader(data, -1), nil)
+	require.NoError(t, err)
+
+	tbl, err = tbl.Delete(ctx, iceberg.LessThanEqual(iceberg.Reference("id"), int64(2)), nil)
+	require.NoError(t, err)
+	require.Equal(t, "2", tbl.CurrentSnapshot().Summary.Properties["total-position-deletes"])
+
+	// ids 1 and 2 are already deleted, so only id 3 gets a new position delete.
+	tbl, err = tbl.Delete(ctx, iceberg.LessThanEqual(iceberg.Reference("id"), int64(3)), nil)
+	require.NoError(t, err)
+	assert.Equal(t, []int64{4, 5}, idsInTable(t, tbl))
+	summary := tbl.CurrentSnapshot().Summary.Properties
+	assert.Equal(t, "1", summary["added-position-deletes"])
+	assert.Equal(t, "3", summary["total-position-deletes"])
+}
