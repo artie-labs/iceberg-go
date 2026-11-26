@@ -69,8 +69,9 @@ type oracle struct {
 	cols    []oracleCol // cols[0] is the required int64 "id"
 	rows    map[int64]map[string]any
 	nextID  int64
-	written int // rows ever written, old versions included
-	eqDead  int // rows removed by equality deletes and not yet given a position delete
+	written int              // rows ever written, old versions included
+	dead    []map[string]any // old row versions removed by equality deletes that a later delete may still match
+	eqKeys  int              // equality delete keys ever written
 	ops     []string
 }
 
@@ -155,16 +156,24 @@ func (o *oracle) randomFilter() (iceberg.BooleanExpression, func(map[string]any)
 // with the delete that removes the old ones. The filter is base's keyFilter (lookupFilter per column for a composite
 // key): each key column IN the batch's values and inside their min/max. A composite key is (id, c0); its filter also
 // names decoy rows, and a row matcher keeps only the batch's exact (id, c0) keys. The model is updated by key.
-func (o *oracle) upsert(composite bool) ([]map[string]any, iceberg.BooleanExpression, []table.DeleteOption, string) {
+// deletes is the delete's predicate on a model row, for charging position deletes to dead rows.
+func (o *oracle) upsert(composite bool) (
+	rows []map[string]any, filter iceberg.BooleanExpression, opts []table.DeleteOption, deletes func(map[string]any) bool, desc string,
+) {
 	rows, picked, existing := o.pickRows(composite)
-	desc := fmt.Sprintf("merge %d existing + %d new keys", len(picked), len(rows)-len(picked))
+	desc = fmt.Sprintf("merge %d existing + %d new keys", len(picked), len(rows)-len(picked))
 
 	if !composite {
 		if len(picked) == 0 { // base skips the delete when no live row has a batch key
-			return rows, nil, nil, desc
+			return rows, nil, nil, nil, desc
 		}
-		filter := o.lookupFilter(o.cols[0], rows)
-		return rows, filter, nil, desc + " on id, filter " + filter.String()
+		ids := map[string]bool{}
+		for _, r := range rows {
+			ids[canon(r["id"])] = true
+		}
+		filter = o.lookupFilter(o.cols[0], rows)
+		deletes = func(r map[string]any) bool { return ids[canon(r["id"])] }
+		return rows, filter, nil, deletes, desc + " on id, filter " + filter.String()
 	}
 
 	keys := map[string]bool{}
@@ -174,13 +183,13 @@ func (o *oracle) upsert(composite bool) ([]map[string]any, iceberg.BooleanExpres
 	decoys := existing[len(picked):]
 	decoys = decoys[:min(len(decoys), 2)]
 	if len(picked)+len(decoys) == 0 {
-		return rows, nil, nil, desc
+		return rows, nil, nil, nil, desc
 	}
 	filterRows := slices.Clone(rows)
 	for _, id := range decoys {
 		filterRows = append(filterRows, o.rows[id])
 	}
-	filter := iceberg.NewAnd(o.lookupFilter(o.cols[0], filterRows), o.lookupFilter(o.cols[1], filterRows))
+	filter = iceberg.NewAnd(o.lookupFilter(o.cols[0], filterRows), o.lookupFilter(o.cols[1], filterRows))
 	match := func(_ context.Context, batch arrow.RecordBatch) (*array.Boolean, error) {
 		b, err := batch.MarshalJSON()
 		if err != nil {
@@ -198,9 +207,10 @@ func (o *oracle) upsert(composite bool) ([]map[string]any, iceberg.BooleanExpres
 
 		return bldr.NewBooleanArray(), nil
 	}
-	opts := []table.DeleteOption{table.WithDeleteRowMatcher([]string{"id", "c0"}, match)}
+	opts = []table.DeleteOption{table.WithDeleteRowMatcher([]string{"id", "c0"}, match)}
+	deletes = func(r map[string]any) bool { return keys[canon(r["id"])+"|"+canon(r["c0"])] }
 
-	return rows, filter, opts, desc + fmt.Sprintf(" on (id, c0), decoys %v, filter %s", decoys, filter)
+	return rows, filter, opts, deletes, desc + fmt.Sprintf(" on (id, c0), decoys %v, filter %s", decoys, filter)
 }
 
 // pickRows returns new versions of up to 5 random existing keys followed by 1-5 new rows, and updates the model.
@@ -240,8 +250,11 @@ func (o *oracle) pickRows(composite bool) (rows []map[string]any, picked, existi
 // eqMerge picks a batch like upsert and makes some existing keys CDC deletes: the key is in the batch, the row is not.
 // It returns every batch key, which base's equality path deletes whether or not it is live, and the rows to write.
 func (o *oracle) eqMerge(composite bool) (keys, rows []map[string]any, desc string) {
+	old := maps.Clone(o.rows)
 	batch, picked, _ := o.pickRows(composite)
-	o.eqDead += len(picked)
+	for _, id := range picked {
+		o.dead = append(o.dead, old[id])
+	}
 	keyCols := o.cols[:1]
 	if composite {
 		keyCols = o.cols[:2]
@@ -261,6 +274,8 @@ func (o *oracle) eqMerge(composite bool) (keys, rows []map[string]any, desc stri
 		}
 		rows = append(rows, r)
 	}
+
+	o.eqKeys += len(keys)
 
 	return keys, rows, fmt.Sprintf("equality merge %d existing (%d deleted) + %d new keys on %v",
 		len(picked), deleted, len(batch)-len(picked), keyCols)
@@ -596,6 +611,8 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 	prevDels := 0
 	for step := range steps {
 		written, live := o.written, len(o.rows)
+		var deletes func(map[string]any) bool // the op's delete predicate, nil for an op that writes no position deletes
+		eqOp := false
 		op := o.rng.Intn(100)
 		for version == "3" && op >= 30 && op < 45 { // no Spark appends on v3: redraw so the other ops keep their share
 			op = o.rng.Intn(100)
@@ -647,8 +664,13 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 				return fail("go delete: %v", err)
 			}
 			maps.DeleteFunc(o.rows, func(_ int64, r map[string]any) bool { return match(r) })
+			deletes = match
 		case op < 73:
-			rows, filter, opts, desc := o.upsert(o.rng.Intn(2) == 0)
+			var rows []map[string]any
+			var filter iceberg.BooleanExpression
+			var opts []table.DeleteOption
+			var desc string
+			rows, filter, opts, deletes, desc = o.upsert(o.rng.Intn(2) == 0)
 			o.ops = append(o.ops, "go "+desc)
 			arrSchema, err := table.SchemaToArrowSchema(tbl.Schema(), nil, true, false)
 			if err != nil {
@@ -676,18 +698,11 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 				return fail("go merge: %v", err)
 			}
 		case op < 87:
-			eqBefore, _ := summaryInt(tbl, "total-equality-deletes") // missing before the first equality delete
+			eqOp = true
 			keys, rows, desc := o.eqMerge(o.rng.Intn(2) == 0 && o.cols[1].typ != iceberg.PrimitiveTypes.Float64)
 			o.ops = append(o.ops, "go "+desc)
 			if tbl, err = eqDelta(s.ctx, tbl, keys, rows); err != nil {
 				return fail("go equality merge: %v", err)
-			}
-			eqAfter, err := summaryInt(tbl, "total-equality-deletes")
-			if err != nil {
-				return fail("%v", err)
-			}
-			if eqAfter-eqBefore != len(keys) {
-				return fail("total-equality-deletes went %d -> %d, but the op wrote %d keys", eqBefore, eqAfter, len(keys))
 			}
 		default:
 			c := oracleCol{fmt.Sprintf("c%d", len(o.cols)-1), oracleTypes[o.rng.Intn(len(oracleTypes))]}
@@ -715,15 +730,32 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 		if err != nil {
 			return fail("%v", err)
 		}
-		// Known bug: a filter delete also writes position deletes for rows that equality deletes already removed, as its
-		// scan applies only position deletes (positionDeletesForFilter drops a task's EqualityDeleteFiles). Each such row
-		// gets at most one, so the excess is charged to eqDead until this is fixed.
+		// Documented limitation (see positionDeletesForFilter): a delete's scan does not apply equality deletes, so a
+		// dead row the delete matches may get a position delete too. Allow one per such row, then forget the row.
 		removed := (o.written - written) - (len(o.rows) - live)
-		if excess := dels - prevDels - removed; excess > 0 {
-			o.eqDead -= excess
-			if o.eqDead < 0 {
-				return fail("total-position-deletes went %d -> %d, but the op removed %d rows", prevDels, dels, removed)
-			}
+		allowed := 0
+		if deletes != nil {
+			o.dead = slices.DeleteFunc(o.dead, func(r map[string]any) bool {
+				if deletes(r) {
+					allowed++
+					return true
+				}
+				return false
+			})
+		}
+		if eqOp && dels != prevDels {
+			return fail("total-position-deletes went %d -> %d on an equality merge", prevDels, dels)
+		}
+		if dels-prevDels > removed+allowed {
+			return fail("total-position-deletes went %d -> %d, but the op removed %d rows and matched %d equality-deleted rows",
+				prevDels, dels, removed, allowed)
+		}
+		eqDels, err := summaryInt(tbl, "total-equality-deletes")
+		if err != nil && o.eqKeys > 0 { // missing before the first equality delete
+			return fail("%v", err)
+		}
+		if eqDels != o.eqKeys {
+			return fail("total-equality-deletes is %d, want %d", eqDels, o.eqKeys)
 		}
 		prevDels = dels
 	}
