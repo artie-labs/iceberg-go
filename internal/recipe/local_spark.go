@@ -31,6 +31,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/testcontainers/testcontainers-go/modules/compose"
 )
 
@@ -129,11 +130,12 @@ func executeSparkContainer(ctx context.Context, scriptPath string, args ...strin
 	}
 	defer attachResp.Close()
 
-	output, err := io.ReadAll(attachResp.Reader)
-	if err != nil {
+	// Without a TTY the stream is multiplexed: StdCopy drops the frame headers, which are binary.
+	var output bytes.Buffer
+	if _, err := stdcopy.StdCopy(&output, &output, attachResp.Reader); err != nil {
 		return "", err
 	}
-	fmt.Printf("%s\n", string(output))
+	fmt.Printf("%s\n", output.String())
 
 	inspect, err := cli.ContainerExecInspect(ctx, response.ID)
 	if err != nil {
@@ -143,7 +145,7 @@ func executeSparkContainer(ctx context.Context, scriptPath string, args ...strin
 		return "", fmt.Errorf("failed to execute script with exit code: %d", inspect.ExitCode)
 	}
 
-	return string(output), nil
+	return output.String(), nil
 }
 
 var (
