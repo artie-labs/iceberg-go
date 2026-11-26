@@ -386,11 +386,26 @@ func (t *toSubstraitExpr) makeSetFunc(id extensions.ID, term iceberg.BoundTerm, 
 }
 
 func (t *toSubstraitExpr) VisitIn(term iceberg.BoundTerm, lits iceberg.Set[iceberg.Literal]) expr.Builder {
+	if _, ok := term.Type().(iceberg.BooleanType); ok {
+		return t.boolIn(term, lits)
+	}
+
 	return t.makeSetFunc(isInID, term, lits)
 }
 
+// boolIn ORs an equal per value, since arrow-go's is_in reads a boolean column one byte per row instead of one bit.
+// The is_not_null keeps is_in's false, not NULL, for a NULL value.
+func (t *toSubstraitExpr) boolIn(term iceberg.BoundTerm, lits iceberg.Set[iceberg.Literal]) expr.Builder {
+	match := t.VisitFalse()
+	for _, lit := range lits.Members() {
+		match = t.VisitOr(match, t.makeLitFunc(equalID, term, lit))
+	}
+
+	return t.VisitAnd(t.makeRefFunc(isNotNullID, term), match)
+}
+
 func (t *toSubstraitExpr) VisitNotIn(term iceberg.BoundTerm, lits iceberg.Set[iceberg.Literal]) expr.Builder {
-	return t.bldr.ScalarFunc(notID).Args(t.makeSetFunc(isInID, term, lits).(expr.FuncArgBuilder))
+	return t.VisitNot(t.VisitIn(term, lits))
 }
 
 func (t *toSubstraitExpr) makeRefFunc(id extensions.ID, term iceberg.BoundTerm) expr.Builder {
