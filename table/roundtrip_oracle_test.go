@@ -318,11 +318,11 @@ func eqDelta(ctx context.Context, tbl *table.Table, keys, rows []map[string]any)
 
 // dedupeRewrite rewrites like base's Dedupe: it removes every live file outside newFiles that holds an id in ids, and
 // appends the rows of those files without such ids, in one transaction. It returns how many files it rewrote.
-func dedupeRewrite(ctx context.Context, tbl *table.Table, newFiles map[string]bool, ids map[int64]bool) (*table.Table, int, error) {
+func dedupeRewrite(ctx context.Context, tbl *table.Table, newFiles map[string]bool, ids map[int64]bool) (*table.Table, int, int, error) {
 	scan := tbl.Scan()
 	tasks, err := scan.PlanFiles(ctx)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	removed := map[string]struct{}{}
 	var remove, dvs []iceberg.DataFile
@@ -339,13 +339,13 @@ func dedupeRewrite(ctx context.Context, tbl *table.Table, newFiles map[string]bo
 		}
 		_, records, err := scan.ReadTasks(ctx, []table.FileScanTask{task})
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, 0, err
 		}
 		var recs []arrow.RecordBatch
 		loses := false
 		for rec, err := range records {
 			if err != nil {
-				return nil, 0, err
+				return nil, 0, 0, err
 			}
 			idCol := rec.Column(rec.Schema().FieldIndices("id")[0]).(*array.Int64)
 			bldr := array.NewBooleanBuilder(memory.DefaultAllocator)
@@ -360,7 +360,7 @@ func dedupeRewrite(ctx context.Context, tbl *table.Table, newFiles map[string]bo
 			mask.Release()
 			rec.Release()
 			if err != nil {
-				return nil, 0, err
+				return nil, 0, 0, err
 			}
 			recs = append(recs, keep)
 		}
@@ -372,7 +372,7 @@ func dedupeRewrite(ctx context.Context, tbl *table.Table, newFiles map[string]bo
 			continue
 		}
 		if _, ok := removed[path]; ok {
-			return nil, 0, fmt.Errorf("file %s planned twice", path)
+			return nil, 0, 0, fmt.Errorf("file %s planned twice", path)
 		}
 		removed[path] = struct{}{}
 		remove = append(remove, task.File)
@@ -380,24 +380,25 @@ func dedupeRewrite(ctx context.Context, tbl *table.Table, newFiles map[string]bo
 		kept = append(kept, recs...)
 	}
 	if len(remove) == 0 {
-		return tbl, 0, nil
+		return tbl, 0, 0, nil
 	}
 
 	fs, err := tbl.FS(ctx)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	deadDeletes, err := table.CollectDeadPositionDeletes(ctx, fs, tbl.CurrentSnapshot(), removed)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	tx := tbl.NewTransaction()
 	if err := tx.AssertRefSnapshotID(""); err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	props := iceberg.Properties{"artie.dedupe": "removed duplicate rows"}
-	if err := tx.ReplaceFiles(ctx, remove, nil, append(deadDeletes, dvs...), props); err != nil {
-		return nil, 0, err
+	drop := append(deadDeletes, dvs...)
+	if err := tx.ReplaceFiles(ctx, remove, nil, drop, props); err != nil {
+		return nil, 0, 0, err
 	}
 	var rows int64
 	for _, rec := range kept {
@@ -406,17 +407,17 @@ func dedupeRewrite(ctx context.Context, tbl *table.Table, newFiles map[string]bo
 	if rows > 0 {
 		rdr, err := array.NewRecordReader(kept[0].Schema(), kept)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, 0, err
 		}
 		err = tx.Append(ctx, rdr, props)
 		rdr.Release()
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, 0, err
 		}
 	}
 	tbl, err = tx.Commit(ctx)
 
-	return tbl, len(remove), err
+	return tbl, len(remove), len(drop), err
 }
 
 func livePaths(ctx context.Context, tbl *table.Table) (map[string]bool, error) {
@@ -843,11 +844,23 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 			for p := range before {
 				delete(after, p)
 			}
-			var n int
-			if tbl, n, err = dedupeRewrite(s.ctx, tbl, after, ids); err != nil {
+			delFiles, err := summaryInt(tbl, "total-delete-files")
+			if err != nil {
+				return fail("%v", err)
+			}
+			var n, drop int
+			if tbl, n, drop, err = dedupeRewrite(s.ctx, tbl, after, ids); err != nil {
 				return fail("dedupe: %v", err)
 			}
-			o.ops[len(o.ops)-1] += fmt.Sprintf(" rewrote %d files", n)
+			o.ops[len(o.ops)-1] += fmt.Sprintf(" rewrote %d files, dropped %d delete files", n, drop)
+			// Orphaned deletes leave reads unchanged, so check that every dead delete and DV left the table.
+			left, err := summaryInt(tbl, "total-delete-files")
+			if err != nil {
+				return fail("%v", err)
+			}
+			if left != delFiles-drop {
+				return fail("total-delete-files went %d -> %d, but the dedupe dropped %d", delFiles, left, drop)
+			}
 		default:
 			c := oracleCol{fmt.Sprintf("c%d", len(o.cols)-1), oracleTypes[o.rng.Intn(len(oracleTypes))]}
 			o.ops = append(o.ops, fmt.Sprintf("add column %s %s", c.name, c.typ))
