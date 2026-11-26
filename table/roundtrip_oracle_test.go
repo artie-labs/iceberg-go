@@ -48,7 +48,8 @@ import (
 // from Spark), deletes, merges (delete + append in one transaction) and column
 // adds against one merge-on-read table. It keeps the expected rows in memory,
 // checks a Go scan after every op and a Spark read at the end.
-// Opt-in: ORACLE_SEEDS=1,2,3 make integration-oracle. Replay a failure with its seed.
+// Opt-in: ORACLE_SEEDS=2,3,4 make integration-oracle. Replay a failure with its seed.
+// Seeds 1 and 13 fail until arrow-go's IsIn on bool arrays is fixed: a bool IN (true, false) misses rows.
 
 type oracleCol struct {
 	name string
@@ -150,8 +151,8 @@ func (o *oracle) randomFilter() (iceberg.BooleanExpression, func(map[string]any)
 
 // upsert picks existing and new keys like a merge batch in base/lib/iceberg/merge, and returns the new row versions
 // with the delete that removes the old ones. The filter is base's keyFilter (lookupFilter per column for a composite
-// key): each key column IN the batch's values and inside their min/max. A composite key is (id, c0); its filter also names decoy rows, and a row matcher keeps
-// only the batch's exact (id, c0) keys. The model is updated by key.
+// key): each key column IN the batch's values and inside their min/max. A composite key is (id, c0); its filter also
+// names decoy rows, and a row matcher keeps only the batch's exact (id, c0) keys. The model is updated by key.
 func (o *oracle) upsert(composite bool) ([]map[string]any, iceberg.BooleanExpression, []table.DeleteOption, string) {
 	var existing []int64
 	for _, id := range slices.Sorted(maps.Keys(o.rows)) {
@@ -433,10 +434,27 @@ func (s *SparkIntegrationTestSuite) sparkRows(o *oracle, name string) ([]map[str
 	return nil, fmt.Errorf("no JSON row in spark output:\n%s", out)
 }
 
+// mergeDelete deletes like base's stageFilterDeletes: a v2 merge writes full file_path metrics on its position deletes
+// only for this delete.
+func mergeDelete(ctx context.Context, tx *table.Transaction, version string, filter iceberg.BooleanExpression, opts []table.DeleteOption) error {
+	if version != "2" {
+		return tx.Delete(ctx, filter, nil, opts...)
+	}
+	key := table.MetricsModeColumnConfPrefix + "." + iceberg.PositionalDeleteSchema.Field(0).Name
+	if err := tx.SetProperties(iceberg.Properties{key: "full"}); err != nil {
+		return err
+	}
+	if err := tx.Delete(ctx, filter, nil, opts...); err != nil {
+		return err
+	}
+
+	return tx.RemoveProperties([]string{key})
+}
+
 func (s *SparkIntegrationTestSuite) TestRoundTripOracle() {
 	seeds := os.Getenv("ORACLE_SEEDS")
 	if seeds == "" {
-		s.T().Skip("set ORACLE_SEEDS (e.g. 1,2,3) to run the round-trip oracle")
+		s.T().Skip("set ORACLE_SEEDS (e.g. 2,3,4) to run the round-trip oracle")
 	}
 	steps := 12
 	if v, err := strconv.Atoi(os.Getenv("ORACLE_STEPS")); err == nil {
@@ -483,7 +501,7 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 	if err != nil {
 		return fail("create: %v", err)
 	}
-	o.ops = append(o.ops, fmt.Sprintf("create v%s merge-on-read cols=%v", version, o.cols))
+	o.ops = append(o.ops, fmt.Sprintf("create %s v%s merge-on-read cols=%v", name, version, o.cols))
 
 	for step := range steps {
 		op := o.rng.Intn(100)
@@ -549,7 +567,7 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 			rdr := array.NewTableReader(arrTbl, -1)
 			tx := tbl.NewTransaction()
 			if filter != nil {
-				err = tx.Delete(s.ctx, filter, nil, opts...)
+				err = mergeDelete(s.ctx, tx, version, filter, opts)
 			}
 			if err == nil {
 				err = tx.Append(s.ctx, rdr, nil)
@@ -584,7 +602,11 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 		}
 		// A repeated position delete leaves reads unchanged but inflates the total that production derives row counts
 		// from. Deletes of a dropped file may still count, so this is a bound: each written row is deleted at most once.
-		dels, _ := strconv.Atoi(tbl.CurrentSnapshot().Summary.Properties["total-position-deletes"])
+		raw, ok := tbl.CurrentSnapshot().Summary.Properties["total-position-deletes"]
+		dels, err := strconv.Atoi(raw)
+		if !ok || err != nil {
+			return fail("total-position-deletes is %q (present=%v)", raw, ok)
+		}
 		if dels > o.written-len(o.rows) {
 			return fail("total-position-deletes %d > %d rows written - %d live", dels, o.written, len(o.rows))
 		}
