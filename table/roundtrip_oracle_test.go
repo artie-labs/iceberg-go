@@ -55,6 +55,8 @@ type oracleCol struct {
 	typ  iceberg.PrimitiveType
 }
 
+func (c oracleCol) String() string { return c.name + " " + c.typ.String() }
+
 var oracleTypes = []iceberg.PrimitiveType{
 	iceberg.PrimitiveTypes.Int32, iceberg.PrimitiveTypes.Int64, iceberg.PrimitiveTypes.String,
 	iceberg.PrimitiveTypes.Bool, iceberg.PrimitiveTypes.Float64, iceberg.PrimitiveTypes.Date,
