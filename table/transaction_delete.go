@@ -72,7 +72,7 @@ func (t *Transaction) performCopyOnWriteDeletion(ctx context.Context, operation 
 	updater.setOverwriteCaseSensitive(caseSensitive)
 	updater.setManifestConcurrency(concurrency)
 
-	filesToDelete, entriesToRewrite, err := t.classifyFilesForDeletions(ctx, fs, filter, caseSensitive, concurrency)
+	filesToDelete, entriesToRewrite, err := t.classifyFilesForDeletions(ctx, fs, filter, caseSensitive, concurrency, false)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -131,7 +131,7 @@ func (t *Transaction) performCopyOnWriteDeletion(ctx context.Context, operation 
 	return updater, wfs, nil
 }
 
-func (t *Transaction) performMergeOnReadDeletion(ctx context.Context, snapshotProps iceberg.Properties, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) (*snapshotProducer, error) {
+func (t *Transaction) performMergeOnReadDeletion(ctx context.Context, snapshotProps iceberg.Properties, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int, matcher *deleteRowMatcher) (*snapshotProducer, error) {
 	meta, err := t.txnMeta()
 	if err != nil {
 		return nil, err
@@ -162,7 +162,8 @@ func (t *Transaction) performMergeOnReadDeletion(ctx context.Context, snapshotPr
 	updater.setOverwriteCaseSensitive(caseSensitive)
 	updater.setManifestConcurrency(concurrency)
 
-	filesToDelete, withPartialDeletions, err := t.classifyFilesForDeletions(ctx, fs, filter, caseSensitive, concurrency)
+	// With a matcher the filter only matches a superset, so a file it matches whole may still keep rows.
+	filesToDelete, withPartialDeletions, err := t.classifyFilesForDeletions(ctx, fs, filter, caseSensitive, concurrency, matcher != nil)
 	if err != nil {
 		return nil, err
 	}
@@ -197,7 +198,7 @@ func (t *Transaction) performMergeOnReadDeletion(ctx context.Context, snapshotPr
 		for _, entry := range withPartialDeletions {
 			partialFiles = append(partialFiles, entry.DataFile())
 		}
-		referenced, err := t.writePositionDeletesForFiles(ctx, fs, updater, dvs, folded, partialFiles, filter, caseSensitive, concurrency, commitUUID)
+		referenced, err := t.writePositionDeletesForFiles(ctx, fs, updater, dvs, folded, partialFiles, filter, caseSensitive, concurrency, commitUUID, matcher)
 		if err != nil {
 			return nil, err
 		}
@@ -242,6 +243,28 @@ type DeleteOption func(deleteOp *deleteOperation)
 type deleteOperation struct {
 	caseSensitive bool
 	concurrency   int
+	rowMatcher    *deleteRowMatcher
+}
+
+// DeleteRowMatcher reports, for each row of a batch the delete filter matched, whether to delete it. The batch holds
+// the matcher's columns and the filter's, under their schema names. It runs on several scan workers at once, so it
+// must be safe for concurrent use. The caller releases the returned mask; a null entry keeps the row.
+type DeleteRowMatcher func(ctx context.Context, batch arrow.RecordBatch) (*array.Boolean, error)
+
+type deleteRowMatcher struct {
+	columns []string
+	match   DeleteRowMatcher
+}
+
+// WithDeleteRowMatcher deletes only the rows that match the filter and that match also selects; columns are the
+// columns match reads. The filter must then match a superset of the rows to delete; it still prunes files and row
+// groups. Use it when the exact rows are cheap to test in Go but expensive as an expression, such as many composite
+// keys: an OR of one conjunction per key is evaluated against every row. Only merge-on-read deletes support it; a
+// copy-on-write Delete returns an error.
+func WithDeleteRowMatcher(columns []string, match DeleteRowMatcher) DeleteOption {
+	return func(op *deleteOperation) {
+		op.rowMatcher = &deleteRowMatcher{columns: columns, match: match}
+	}
 }
 
 // WithDeleteConcurrency overwrites the default concurrency for delete operations.
@@ -269,7 +292,7 @@ func WithDeleteCaseInsensitive() DeleteOption {
 // Delete deletes records matching the provided filter.
 //
 // The provided filter acts as a row-level predicate on existing data:
-//   - Files where all rows match the filter (strict match) are completely deleted
+//   - Files where all rows match the filter (strict match) are completely deleted, unless WithDeleteRowMatcher is set
 //   - Files where some rows match and others don't (partial match) are rewritten to keep only non-matching rows
 //   - Files where no rows match the filter are kept unchanged
 //
@@ -311,6 +334,12 @@ func (t *Transaction) Delete(ctx context.Context, filter iceberg.BooleanExpressi
 	if meta.formatVersion > 1 {
 		writeDeleteMode = meta.props.Get(WriteDeleteModeKey, WriteDeleteModeDefault)
 	}
+	if deleteOp.rowMatcher != nil && writeDeleteMode != WriteModeMergeOnRead {
+		return fmt.Errorf("a delete row matcher needs %s=%s, not %q", WriteDeleteModeKey, WriteModeMergeOnRead, writeDeleteMode)
+	}
+	if deleteOp.rowMatcher != nil && filter == nil {
+		filter = iceberg.AlwaysTrue{}
+	}
 	switch writeDeleteMode {
 	case WriteModeCopyOnWrite:
 		updater, _, err = t.performCopyOnWriteDeletion(ctx, OpDelete, snapshotProps, filter, deleteOp.caseSensitive, deleteOp.concurrency)
@@ -318,7 +347,7 @@ func (t *Transaction) Delete(ctx context.Context, filter iceberg.BooleanExpressi
 			return err
 		}
 	case WriteModeMergeOnRead:
-		updater, err = t.performMergeOnReadDeletion(ctx, snapshotProps, filter, deleteOp.caseSensitive, deleteOp.concurrency)
+		updater, err = t.performMergeOnReadDeletion(ctx, snapshotProps, filter, deleteOp.caseSensitive, deleteOp.concurrency, deleteOp.rowMatcher)
 		if err != nil {
 			return err
 		}
@@ -337,7 +366,7 @@ func (t *Transaction) Delete(ctx context.Context, filter iceberg.BooleanExpressi
 // classifyFilesForDeletions classifies existing data files based on the provided filter.
 // Returns files to delete completely, the manifest entries of files that partially match, and any error.
 // Partial matches stay entries because their sequence numbers decide which deletes apply and seed row-lineage synthesis.
-func (t *Transaction) classifyFilesForDeletions(ctx context.Context, fs io.IO, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) (filesToDelete []iceberg.DataFile, filesWithPartialDeletions []iceberg.ManifestEntry, err error) {
+func (t *Transaction) classifyFilesForDeletions(ctx context.Context, fs io.IO, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int, keepWhole bool) (filesToDelete []iceberg.DataFile, filesWithPartialDeletions []iceberg.ManifestEntry, err error) {
 	meta, err := t.txnMeta()
 	if err != nil {
 		return nil, nil, err
@@ -348,7 +377,7 @@ func (t *Transaction) classifyFilesForDeletions(ctx context.Context, fs io.IO, f
 		return nil, nil, nil
 	}
 
-	if filter == nil || filter.Equals(iceberg.AlwaysTrue{}) {
+	if !keepWhole && (filter == nil || filter.Equals(iceberg.AlwaysTrue{})) {
 		for df, err := range s.dataFiles(ctx, fs, nil) {
 			if err != nil {
 				return nil, nil, err
@@ -361,7 +390,7 @@ func (t *Transaction) classifyFilesForDeletions(ctx context.Context, fs io.IO, f
 		return filesToDelete, nil, nil
 	}
 
-	return t.classifyFilesForFilteredDeletions(ctx, fs, filter, caseSensitive, concurrency)
+	return t.classifyFilesForFilteredDeletions(ctx, fs, filter, caseSensitive, concurrency, keepWhole)
 }
 
 type fileClassificationTask struct {
@@ -392,7 +421,7 @@ func (t *fileClassificationTask) buildPartitionProjection(specID int) (iceberg.B
 
 // classifyFilesForFilteredDeletions classifies files for filtered overwrite operations.
 // Returns files to delete completely, the manifest entries of files that partially match, and any error.
-func (t *Transaction) classifyFilesForFilteredDeletions(ctx context.Context, fs io.IO, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) (filesToDelete []iceberg.DataFile, filesWithPartialDeletes []iceberg.ManifestEntry, err error) {
+func (t *Transaction) classifyFilesForFilteredDeletions(ctx context.Context, fs io.IO, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int, keepWhole bool) (filesToDelete []iceberg.DataFile, filesWithPartialDeletes []iceberg.ManifestEntry, err error) {
 	meta, err := t.txnMeta()
 	if err != nil {
 		return nil, nil, err
@@ -484,7 +513,7 @@ func (t *Transaction) classifyFilesForFilteredDeletions(ctx context.Context, fs 
 					return fmt.Errorf("failed to evaluate data file %s with strict evaluator: %w", df.FilePath(), err)
 				}
 
-				if strict {
+				if strict && !keepWhole {
 					localDelete = append(localDelete, df)
 				} else {
 					localRewrite = append(localRewrite, entry)
@@ -914,13 +943,13 @@ func isNullPositionDeletePath(values arrow.TypedArray[string], column arrow.Arra
 // files that match filter, appends them to updater, and returns the distinct
 // data-file paths those deletes reference, including paths in v2 delete files
 // that cover more than one data file.
-func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO, updater *snapshotProducer, dvs liveDeletionVectors, folded foldedPositionDeletes, files []iceberg.DataFile, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int, commitUUID uuid.UUID) ([]string, error) {
+func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO, updater *snapshotProducer, dvs liveDeletionVectors, folded foldedPositionDeletes, files []iceberg.DataFile, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int, commitUUID uuid.UUID, matcher *deleteRowMatcher) ([]string, error) {
 	meta, err := t.txnMeta()
 	if err != nil {
 		return nil, err
 	}
 
-	posDeleteRecIter, err := t.makePositionDeleteRecordsForFilter(ctx, fs, files, filter, caseSensitive, concurrency)
+	posDeleteRecIter, err := t.makePositionDeleteRecordsForFilter(ctx, fs, files, filter, caseSensitive, concurrency, matcher)
 	if err != nil {
 		return nil, err
 	}
@@ -1136,7 +1165,7 @@ func foldPositionDeletes(ctx context.Context, fs io.IO, partial []iceberg.Manife
 	return folded, nil
 }
 
-func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs io.IO, files []iceberg.DataFile, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) (seq2 iter.Seq2[arrow.RecordBatch, error], err error) {
+func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs io.IO, files []iceberg.DataFile, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int, matcher *deleteRowMatcher) (seq2 iter.Seq2[arrow.RecordBatch, error], err error) {
 	meta, err := t.txnMeta()
 	if err != nil {
 		return nil, err
@@ -1207,6 +1236,18 @@ func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs
 	for _, id := range filterIDs {
 		selected[id] = iceberg.Void{}
 	}
+	if matcher != nil {
+		for _, name := range matcher.columns {
+			field, ok := meta.CurrentSchema().FindFieldByNameCaseInsensitive(name)
+			if caseSensitive {
+				field, ok = meta.CurrentSchema().FindFieldByName(name)
+			}
+			if !ok {
+				return nil, fmt.Errorf("delete row matcher column %q is not in the table schema", name)
+			}
+			selected[field.ID] = iceberg.Void{}
+		}
+	}
 	projection, err := iceberg.PruneColumns(meta.CurrentSchema(), selected, false)
 	if err != nil {
 		return nil, err
@@ -1221,6 +1262,7 @@ func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs
 		caseSensitive:   caseSensitive,
 		rowLimit:        -1, // No limit
 		concurrency:     concurrency,
+		deleteMatcher:   matcher,
 	}
 	invariants, err := scanner.scanInvariants(builtMeta.Properties())
 	if err != nil {

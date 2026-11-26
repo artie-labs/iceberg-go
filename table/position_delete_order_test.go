@@ -134,7 +134,7 @@ func TestPositionDeleteFilesSortedByPathAndPosition(t *testing.T) {
 
 	files := []iceberg.DataFile{tasks[2].File, tasks[1].File, tasks[0].File}
 	records, err := txn.makePositionDeleteRecordsForFilter(t.Context(), fs, files,
-		iceberg.GreaterThanEqual(iceberg.Reference("id"), int64(0)), true, 3)
+		iceberg.GreaterThanEqual(iceberg.Reference("id"), int64(0)), true, 3, nil)
 	require.NoError(t, err)
 	meta, err := txn.txnMeta()
 	require.NoError(t, err)
