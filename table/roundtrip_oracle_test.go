@@ -55,6 +55,8 @@ type oracleCol struct {
 	typ  iceberg.PrimitiveType
 }
 
+func (c oracleCol) String() string { return c.name + " " + c.typ.String() }
+
 var oracleTypes = []iceberg.PrimitiveType{
 	iceberg.PrimitiveTypes.Int32, iceberg.PrimitiveTypes.Int64, iceberg.PrimitiveTypes.String,
 	iceberg.PrimitiveTypes.Bool, iceberg.PrimitiveTypes.Float64, iceberg.PrimitiveTypes.Date,
@@ -490,8 +492,11 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 	for step := range steps {
 		written, live := o.written, len(o.rows)
 		op := o.rng.Intn(100)
+		for version == "3" && op >= 30 && op < 45 { // no Spark appends on v3: redraw so the other ops keep their share
+			op = o.rng.Intn(100)
+		}
 		switch {
-		case step == 0 || op < 30 || (version == "3" && op < 45): // Spark 1.8 in the stack cannot write v3 (first-row-id is null)
+		case step == 0 || op < 30:
 			rows := o.newRows(1 + o.rng.Intn(20))
 			o.ops = append(o.ops, fmt.Sprintf("go append %d rows", len(rows)))
 			arrSchema, err := table.SchemaToArrowSchema(tbl.Schema(), nil, true, false)
@@ -508,7 +513,7 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 			if err != nil {
 				return fail("go append: %v", err)
 			}
-		case op < 45:
+		case op < 45: // never on v3: Spark 1.8 in the stack cannot write v3 (first-row-id is null)
 			rows := o.newRows(1 + o.rng.Intn(10))
 			o.ops = append(o.ops, fmt.Sprintf("spark append %d rows", len(rows)))
 			names := make([]string, len(o.cols))
