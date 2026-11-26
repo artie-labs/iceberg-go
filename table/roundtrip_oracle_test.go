@@ -22,7 +22,6 @@ package table_test
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -179,40 +178,50 @@ func canon(v any) string {
 	}
 }
 
-func (o *oracle) canonRows(rows []map[string]any) map[string]string {
-	out := make(map[string]string, len(rows))
-	for _, r := range rows {
-		parts := make([]string, len(o.cols))
-		for i, c := range o.cols {
-			parts[i] = c.name + "=" + canon(r[c.name])
-		}
-		out[canon(r["id"])] = strings.Join(parts, " ")
+func (o *oracle) canonRow(r map[string]any) string {
+	parts := make([]string, len(o.cols))
+	for i, c := range o.cols {
+		parts[i] = c.name + "=" + canon(r[c.name])
 	}
 
-	return out
+	return strings.Join(parts, " ")
 }
 
-// diff returns "" when got matches the model, else the first few differences.
+// diff returns "" when got matches the model, else the first few differences. A duplicated id lists every copy, so a
+// stale copy next to the right one still shows.
 func (o *oracle) diff(got []map[string]any) string {
-	want := o.canonRows(slices.Collect(func(yield func(map[string]any) bool) {
-		for _, r := range o.rows {
-			if !yield(r) {
-				return
-			}
-		}
-	}))
-	have := o.canonRows(got)
-	var out []string
-	for id, w := range want {
-		if h, ok := have[id]; !ok {
-			out = append(out, "missing: "+w)
-		} else if h != w {
-			out = append(out, "want: "+w+"\n  got: "+h)
+	want := map[string]string{}
+	for _, r := range o.rows {
+		want[canon(r["id"])] = o.canonRow(r)
+	}
+	have := map[string][]string{}
+	for _, r := range got {
+		id := canon(r["id"])
+		have[id] = append(have[id], o.canonRow(r))
+	}
+	ids := slices.Collect(maps.Keys(want))
+	for id := range have {
+		if _, ok := want[id]; !ok {
+			ids = append(ids, id)
 		}
 	}
-	for id, h := range have {
-		if _, ok := want[id]; !ok {
-			out = append(out, "extra: "+h)
+
+	var out []string
+	for _, id := range ids {
+		w, ok := want[id]
+		h := have[id]
+		switch {
+		case len(h) > 1:
+			if !ok {
+				w = "none"
+			}
+			out = append(out, fmt.Sprintf("duplicate: id=%s %d rows, want: %s\n  got: %s", id, len(h), w, strings.Join(h, "\n  got: ")))
+		case !ok:
+			out = append(out, "extra: "+h[0])
+		case len(h) == 0:
+			out = append(out, "missing: "+w)
+		case h[0] != w:
+			out = append(out, "want: "+w+"\n  got: "+h[0])
 		}
 	}
 	slices.Sort(out)
@@ -256,23 +265,6 @@ func goScan(ctx context.Context, tbl *table.Table) ([]map[string]any, error) {
 	return rows, rdr.Err()
 }
 
-// demuxDocker strips the 8-byte frame headers from a non-TTY docker exec stream.
-func demuxDocker(b []byte) []byte {
-	var out []byte
-	for len(b) >= 8 && (b[0] == 1 || b[0] == 2) && b[1] == 0 && b[2] == 0 && b[3] == 0 {
-		n := int(binary.BigEndian.Uint32(b[4:8]))
-		if 8+n > len(b) {
-			break
-		}
-		if b[0] == 1 {
-			out = append(out, b[8:8+n]...)
-		}
-		b = b[8+n:]
-	}
-
-	return append(out, b...)
-}
-
 func (s *SparkIntegrationTestSuite) sparkRows(o *oracle, name string) ([]map[string]any, error) {
 	cols := make([]string, len(o.cols))
 	for i, c := range o.cols {
@@ -283,7 +275,7 @@ func (s *SparkIntegrationTestSuite) sparkRows(o *oracle, name string) ([]map[str
 	if err != nil {
 		return nil, err
 	}
-	for _, line := range strings.Split(string(demuxDocker([]byte(out))), "\n") {
+	for _, line := range strings.Split(out, "\n") {
 		if strings.HasPrefix(line, "|[") {
 			return decodeRows([]byte(strings.TrimRight(strings.TrimPrefix(line, "|"), " |")))
 		}
