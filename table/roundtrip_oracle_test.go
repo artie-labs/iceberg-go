@@ -21,6 +21,7 @@ package table_test
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -44,8 +45,9 @@ import (
 )
 
 // The round-trip oracle runs a random, seeded sequence of appends (from Go and
-// from Spark), deletes, merges (delete + append in one transaction) and column adds against one merge-on-read table. It keeps the expected
-// rows in memory, checks a Go scan after every op and a Spark read at the end.
+// from Spark), deletes, merges (delete + append in one transaction) and column
+// adds against one merge-on-read table. It keeps the expected rows in memory,
+// checks a Go scan after every op and a Spark read at the end.
 // Opt-in: ORACLE_SEEDS=1,2,3 make integration-oracle. Replay a failure with its seed.
 
 type oracleCol struct {
@@ -145,8 +147,9 @@ func (o *oracle) randomFilter() (iceberg.BooleanExpression, func(map[string]any)
 }
 
 // upsert picks existing and new keys like a merge batch in base/lib/iceberg/merge, and returns the new row versions
-// with the delete that removes the old ones. A composite key is (id, c0): the filter is a superset on id that also
-// names decoy ids, and a row matcher keeps only the exact (id, c0) keys. The model is updated by key.
+// with the delete that removes the old ones. The filter is base's lookupFilter: each key column IN the batch's values
+// and inside their min/max. A composite key is (id, c0); its filter also names decoy rows, and a row matcher keeps
+// only the batch's exact (id, c0) keys. The model is updated by key.
 func (o *oracle) upsert(composite bool) ([]map[string]any, iceberg.BooleanExpression, []table.DeleteOption, string) {
 	var existing []int64
 	for _, id := range slices.Sorted(maps.Keys(o.rows)) {
@@ -176,13 +179,13 @@ func (o *oracle) upsert(composite bool) ([]map[string]any, iceberg.BooleanExpres
 		rows = append(rows, row)
 	}
 	desc := fmt.Sprintf("merge %d existing + %d new keys", len(picked), len(rows)-len(picked))
-	if len(picked) == 0 {
-		return rows, nil, nil, desc
-	}
 
-	ids := slices.Clone(picked)
 	if !composite {
-		return rows, iceberg.IsIn(iceberg.Reference("id"), ids...), nil, desc + fmt.Sprintf(" on id %v", ids)
+		if len(picked) == 0 { // base skips the delete when no live row has a batch key
+			return rows, nil, nil, desc
+		}
+		filter := o.lookupFilter(o.cols[0], rows)
+		return rows, filter, nil, desc + " on id, filter " + filter.String()
 	}
 
 	keys := map[string]bool{}
@@ -190,7 +193,15 @@ func (o *oracle) upsert(composite bool) ([]map[string]any, iceberg.BooleanExpres
 		keys[canon(r["id"])+"|"+canon(r["c0"])] = true
 	}
 	decoys := existing[len(picked):]
-	ids = append(ids, decoys[:min(len(decoys), 2)]...)
+	decoys = decoys[:min(len(decoys), 2)]
+	if len(picked)+len(decoys) == 0 {
+		return rows, nil, nil, desc
+	}
+	filterRows := slices.Clone(rows)
+	for _, id := range decoys {
+		filterRows = append(filterRows, o.rows[id])
+	}
+	filter := iceberg.NewAnd(o.lookupFilter(o.cols[0], filterRows), o.lookupFilter(o.cols[1], filterRows))
 	match := func(_ context.Context, batch arrow.RecordBatch) (*array.Boolean, error) {
 		b, err := batch.MarshalJSON()
 		if err != nil {
@@ -210,7 +221,55 @@ func (o *oracle) upsert(composite bool) ([]map[string]any, iceberg.BooleanExpres
 	}
 	opts := []table.DeleteOption{table.WithDeleteRowMatcher([]string{"id", "c0"}, match)}
 
-	return rows, iceberg.IsIn(iceberg.Reference("id"), ids...), opts, desc + fmt.Sprintf(" on (id, c0), filter id %v", ids)
+	return rows, filter, opts, desc + fmt.Sprintf(" on (id, c0), decoys %v, filter %s", decoys, filter)
+}
+
+// lookupFilter is c IN the rows' values, and for ordered types also inside their min/max, like base's lookupFilter.
+func (o *oracle) lookupFilter(c oracleCol, rows []map[string]any) iceberg.BooleanExpression {
+	var vals []any
+	for _, r := range rows {
+		vals = append(vals, r[c.name])
+	}
+	slices.SortFunc(vals, func(a, b any) int {
+		switch a := a.(type) {
+		case int32:
+			return cmp.Compare(a, b.(int32))
+		case int64:
+			return cmp.Compare(a, b.(int64))
+		case string:
+			return cmp.Compare(a, b.(string))
+		}
+		return 0
+	})
+	lits := make([]iceberg.Literal, len(vals))
+	for i, v := range vals {
+		switch v := v.(type) {
+		case string:
+			if c.typ == iceberg.PrimitiveTypes.Date {
+				d, _ := time.Parse(time.DateOnly, v)
+				lits[i] = iceberg.NewLiteral(iceberg.Date(d.Unix() / 86400))
+			} else {
+				lits[i] = iceberg.NewLiteral(v)
+			}
+		case int32:
+			lits[i] = iceberg.NewLiteral(v)
+		case int64:
+			lits[i] = iceberg.NewLiteral(v)
+		case bool:
+			lits[i] = iceberg.NewLiteral(v)
+		default:
+			lits[i] = iceberg.NewLiteral(v.(float64))
+		}
+	}
+	ref := iceberg.Reference(c.name)
+	in := iceberg.SetPredicate(iceberg.OpIn, ref, lits)
+	switch c.typ {
+	case iceberg.PrimitiveTypes.Bool, iceberg.PrimitiveTypes.Float64:
+		return in
+	}
+
+	return iceberg.NewAnd(in, iceberg.LiteralPredicate(iceberg.OpGTEQ, ref, lits[0]),
+		iceberg.LiteralPredicate(iceberg.OpLTEQ, ref, lits[len(lits)-1]))
 }
 
 func sqlLiteral(v any) string {
