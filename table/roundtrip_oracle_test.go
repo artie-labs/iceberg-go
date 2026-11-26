@@ -248,10 +248,11 @@ func (o *oracle) pickRows(composite bool) (rows []map[string]any, picked, existi
 }
 
 // eqMerge picks a batch like upsert and makes some existing keys CDC deletes: the key is in the batch, the row is not.
-// It returns every batch key, which base's equality path deletes whether or not it is live, and the rows to write.
+// It returns every batch key, which base's equality path deletes whether or not it is live, and the rows to write. A
+// composite key also gets decoys: a live, unpicked id with another c0, which must not delete that row.
 func (o *oracle) eqMerge(composite bool) (keys, rows []map[string]any, desc string) {
 	old := maps.Clone(o.rows)
-	batch, picked, _ := o.pickRows(composite)
+	batch, picked, existing := o.pickRows(composite)
 	for _, id := range picked {
 		o.dead = append(o.dead, old[id])
 	}
@@ -275,10 +276,21 @@ func (o *oracle) eqMerge(composite bool) (keys, rows []map[string]any, desc stri
 		rows = append(rows, r)
 	}
 
+	var decoys []map[string]any
+	if composite {
+		for _, id := range existing[len(picked):min(len(existing), len(picked)+2)] {
+			c0 := o.value(o.cols[1].typ)
+			for c0 == nil || canon(c0) == canon(o.rows[id]["c0"]) {
+				c0 = o.value(o.cols[1].typ)
+			}
+			decoys = append(decoys, map[string]any{"id": id, "c0": c0})
+		}
+		keys = append(keys, decoys...)
+	}
 	o.eqKeys += len(keys)
 
-	return keys, rows, fmt.Sprintf("equality merge %d existing (%d deleted) + %d new keys on %v",
-		len(picked), deleted, len(batch)-len(picked), keyCols)
+	return keys, rows, fmt.Sprintf("equality merge %d existing (%d deleted) + %d new keys on %v, decoys %v",
+		len(picked), deleted, len(batch)-len(picked), keyCols, decoys)
 }
 
 // eqDelta commits like base's stageEqualityDeletes: one row delta with an equality delete for every key, and the rows.
