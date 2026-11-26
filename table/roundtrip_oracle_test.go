@@ -63,11 +63,12 @@ var oracleTypes = []iceberg.PrimitiveType{
 var oracleStrings = []string{"", "a", "b", "it's", "ünï", strings.Repeat("x", 300)}
 
 type oracle struct {
-	rng    *rand.Rand
-	cols   []oracleCol // cols[0] is the required int64 "id"
-	rows   map[int64]map[string]any
-	nextID int64
-	ops    []string
+	rng     *rand.Rand
+	cols    []oracleCol // cols[0] is the required int64 "id"
+	rows    map[int64]map[string]any
+	nextID  int64
+	written int // rows ever written, old versions included
+	ops     []string
 }
 
 func (o *oracle) value(t iceberg.PrimitiveType) any {
@@ -92,6 +93,7 @@ func (o *oracle) value(t iceberg.PrimitiveType) any {
 
 func (o *oracle) newRows(n int) []map[string]any {
 	out := make([]map[string]any, n)
+	o.written += n
 	for i := range out {
 		o.nextID++
 		row := map[string]any{"id": o.nextID}
@@ -159,6 +161,7 @@ func (o *oracle) upsert(composite bool) ([]map[string]any, iceberg.BooleanExpres
 	}
 	o.rng.Shuffle(len(existing), func(i, j int) { existing[i], existing[j] = existing[j], existing[i] })
 	picked := existing[:min(len(existing), o.rng.Intn(6))]
+	o.written += len(picked)
 
 	var rows []map[string]any
 	for _, id := range picked {
@@ -578,6 +581,12 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 		}
 		if d := o.diff(got); d != "" {
 			return fail("go scan differs from model:\n%s", d)
+		}
+		// A repeated position delete leaves reads unchanged but inflates the total that production derives row counts
+		// from. Deletes of a dropped file may still count, so this is a bound: each written row is deleted at most once.
+		dels, _ := strconv.Atoi(tbl.CurrentSnapshot().Summary.Properties["total-position-deletes"])
+		if dels > o.written-len(o.rows) {
+			return fail("total-position-deletes %d > %d rows written - %d live", dels, o.written, len(o.rows))
 		}
 	}
 
