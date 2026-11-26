@@ -79,6 +79,9 @@ integration-rest-scan-planning:
 integration-spark:
 	go test -tags=integration -v -run="^TestSparkIntegration" ./table
 
+integration-oracle:
+	go test -tags=integration -count=1 -v -run="^TestSparkIntegration$$/^TestRoundTripOracle$$" ./table
+
 integration-hive:
 	go test -tags=integration -v ./catalog/hive/...
 
