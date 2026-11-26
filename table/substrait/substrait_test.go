@@ -18,9 +18,16 @@
 package substrait_test
 
 import (
+	"context"
 	"fmt"
+	"strings"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
+	"github.com/apache/arrow-go/v18/arrow/compute/exprs"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table/substrait"
 	"github.com/stretchr/testify/assert"
@@ -187,6 +194,37 @@ func TestExprs(t *testing.T) {
 			_, result, err := substrait.ConvertExpr(tt.schema, bound, true)
 			require.NoError(t, err)
 			assert.Equal(t, tt.expected, result.String())
+		})
+	}
+}
+
+func TestBooleanSetPredicates(t *testing.T) {
+	schema := iceberg.NewSchema(1, iceberg.NestedField{ID: 1, Name: "b", Type: iceberg.PrimitiveTypes.Bool})
+	arrSchema := arrow.NewSchema([]arrow.Field{{Name: "b", Type: arrow.FixedWidthTypes.Boolean, Nullable: true}}, nil)
+	rec, _, err := array.RecordFromJSON(memory.DefaultAllocator, arrSchema,
+		strings.NewReader(`[{"b":false},{"b":false},{"b":true},{"b":null},{"b":true},{"b":false}]`))
+	require.NoError(t, err)
+	defer rec.Release()
+
+	ref := iceberg.Reference("b")
+	for _, tt := range []struct {
+		e    iceberg.BooleanExpression
+		want string
+	}{
+		{iceberg.IsIn(ref, false, true), "[true true true false true true]"},
+		{iceberg.NotIn(ref, false, true), "[false false false true false false]"},
+	} {
+		t.Run(tt.e.String(), func(t *testing.T) {
+			bound, err := iceberg.BindExpr(schema, tt.e, false)
+			require.NoError(t, err)
+			reg, filter, err := substrait.ConvertExpr(schema, bound, true)
+			require.NoError(t, err)
+
+			ctx := exprs.WithExtensionIDSet(context.Background(), exprs.NewExtensionSetDefault(*reg))
+			got, err := exprs.ExecuteScalarExpression(ctx, arrSchema, filter, compute.NewDatumWithoutOwning(rec))
+			require.NoError(t, err)
+			defer got.Release()
+			assert.Equal(t, tt.want, got.(*compute.ArrayDatum).MakeArray().String())
 		})
 	}
 }
