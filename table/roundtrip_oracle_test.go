@@ -147,8 +147,8 @@ func (o *oracle) randomFilter() (iceberg.BooleanExpression, func(map[string]any)
 }
 
 // upsert picks existing and new keys like a merge batch in base/lib/iceberg/merge, and returns the new row versions
-// with the delete that removes the old ones. The filter is base's lookupFilter: each key column IN the batch's values
-// and inside their min/max. A composite key is (id, c0); its filter also names decoy rows, and a row matcher keeps
+// with the delete that removes the old ones. The filter is base's keyFilter (lookupFilter per column for a composite
+// key): each key column IN the batch's values and inside their min/max. A composite key is (id, c0); its filter also names decoy rows, and a row matcher keeps
 // only the batch's exact (id, c0) keys. The model is updated by key.
 func (o *oracle) upsert(composite bool) ([]map[string]any, iceberg.BooleanExpression, []table.DeleteOption, string) {
 	var existing []int64
@@ -332,6 +332,15 @@ func (o *oracle) diff(got []map[string]any) string {
 	}))
 	have := o.canonRows(got)
 	var out []string
+	seen := map[string]int{}
+	for _, r := range got {
+		seen[canon(r["id"])]++
+	}
+	for id, n := range seen {
+		if n > 1 {
+			out = append(out, fmt.Sprintf("duplicate: id=%s %d rows", id, n))
+		}
+	}
 	for id, w := range want {
 		if h, ok := have[id]; !ok {
 			out = append(out, "missing: "+w)
@@ -458,7 +467,7 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 		o.cols = append(o.cols, c)
 		fields = append(fields, iceberg.NestedField{ID: i + 2, Name: c.name, Type: c.typ})
 	}
-	name := fmt.Sprintf("go_oracle_%d", seed)
+	name := fmt.Sprintf("go_oracle_%d_%d", seed, os.Getpid()) // the Docker stack is shared between runs
 	ident := catalog.ToIdentifier("default", name)
 	_ = s.cat.DropTable(s.ctx, ident)
 	version := strconv.Itoa(2 + o.rng.Intn(2)) // v3 merges write deletion vectors
@@ -476,7 +485,7 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 	for step := range steps {
 		op := o.rng.Intn(100)
 		switch {
-		case step == 0 || op < 30:
+		case step == 0 || op < 30 || (version == "3" && op < 45): // Spark 1.8 in the stack cannot write v3 (first-row-id is null)
 			rows := o.newRows(1 + o.rng.Intn(20))
 			o.ops = append(o.ops, fmt.Sprintf("go append %d rows", len(rows)))
 			arrSchema, err := table.SchemaToArrowSchema(tbl.Schema(), nil, true, false)
@@ -579,6 +588,7 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 	if d := o.diff(got); d != "" {
 		return fail("spark read differs from model:\n%s", d)
 	}
+	_ = s.cat.DropTable(s.ctx, ident)
 
 	return ""
 }
