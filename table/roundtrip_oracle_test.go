@@ -36,6 +36,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
@@ -45,7 +46,8 @@ import (
 
 // The round-trip oracle runs a random, seeded sequence of appends (from Go and
 // from Spark), deletes, merges (a filter delete + append in one transaction, or
-// equality deletes + rows in one row delta) and column adds against one
+// equality deletes + rows in one row delta), dedupes (append duplicate keys, then
+// rewrite the files holding the old rows) and column adds against one
 // merge-on-read table. It keeps the expected rows in memory, checks a Go scan
 // after every op and a Spark read at the end.
 // Opt-in: ORACLE_SEEDS=2,3,4 make integration-oracle. Replay a failure with its seed.
@@ -312,6 +314,122 @@ func eqDelta(ctx context.Context, tbl *table.Table, keys, rows []map[string]any)
 	}
 
 	return tx.Commit(ctx)
+}
+
+// dedupeRewrite rewrites like base's Dedupe: it removes every live file outside newFiles that holds an id in ids, and
+// appends the rows of those files without such ids, in one transaction. It returns how many files it rewrote.
+func dedupeRewrite(ctx context.Context, tbl *table.Table, newFiles map[string]bool, ids map[int64]bool) (*table.Table, int, error) {
+	scan := tbl.Scan()
+	tasks, err := scan.PlanFiles(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	removed := map[string]struct{}{}
+	var remove, dvs []iceberg.DataFile
+	var kept []arrow.RecordBatch
+	defer func() {
+		for _, rec := range kept {
+			rec.Release()
+		}
+	}()
+	for _, task := range tasks {
+		path := task.File.FilePath()
+		if newFiles[path] {
+			continue
+		}
+		_, records, err := scan.ReadTasks(ctx, []table.FileScanTask{task})
+		if err != nil {
+			return nil, 0, err
+		}
+		var recs []arrow.RecordBatch
+		loses := false
+		for rec, err := range records {
+			if err != nil {
+				return nil, 0, err
+			}
+			idCol := rec.Column(rec.Schema().FieldIndices("id")[0]).(*array.Int64)
+			bldr := array.NewBooleanBuilder(memory.DefaultAllocator)
+			for i := range idCol.Len() {
+				lose := ids[idCol.Value(i)]
+				loses = loses || lose
+				bldr.Append(!lose)
+			}
+			mask := bldr.NewBooleanArray()
+			bldr.Release()
+			keep, err := compute.FilterRecordBatch(ctx, rec, mask, compute.DefaultFilterOptions())
+			mask.Release()
+			rec.Release()
+			if err != nil {
+				return nil, 0, err
+			}
+			recs = append(recs, keep)
+		}
+		if !loses {
+			for _, rec := range recs {
+				rec.Release()
+			}
+
+			continue
+		}
+		if _, ok := removed[path]; ok {
+			return nil, 0, fmt.Errorf("file %s planned twice", path)
+		}
+		removed[path] = struct{}{}
+		remove = append(remove, task.File)
+		dvs = append(dvs, task.DeletionVectorFiles...)
+		kept = append(kept, recs...)
+	}
+	if len(remove) == 0 {
+		return tbl, 0, nil
+	}
+
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	deadDeletes, err := table.CollectDeadPositionDeletes(ctx, fs, tbl.CurrentSnapshot(), removed)
+	if err != nil {
+		return nil, 0, err
+	}
+	tx := tbl.NewTransaction()
+	if err := tx.AssertRefSnapshotID(""); err != nil {
+		return nil, 0, err
+	}
+	props := iceberg.Properties{"artie.dedupe": "removed duplicate rows"}
+	if err := tx.ReplaceFiles(ctx, remove, nil, append(deadDeletes, dvs...), props); err != nil {
+		return nil, 0, err
+	}
+	var rows int64
+	for _, rec := range kept {
+		rows += rec.NumRows()
+	}
+	if rows > 0 {
+		rdr, err := array.NewRecordReader(kept[0].Schema(), kept)
+		if err != nil {
+			return nil, 0, err
+		}
+		err = tx.Append(ctx, rdr, props)
+		rdr.Release()
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	tbl, err = tx.Commit(ctx)
+
+	return tbl, len(remove), err
+}
+
+func livePaths(ctx context.Context, tbl *table.Table) (map[string]bool, error) {
+	paths := map[string]bool{}
+	if tbl.CurrentSnapshot() == nil {
+		return paths, nil
+	}
+	tasks, err := tbl.Scan().PlanFiles(ctx)
+	for _, task := range tasks {
+		paths[task.File.FilePath()] = true
+	}
+
+	return paths, err
 }
 
 func recordFromRows(sc *arrow.Schema, rows []map[string]any) (arrow.RecordBatch, error) {
@@ -675,7 +793,7 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 			if err != nil {
 				return fail("go merge: %v", err)
 			}
-		case op < 87:
+		case op < 85:
 			eqBefore, _ := summaryInt(tbl, "total-equality-deletes") // missing before the first equality delete
 			keys, rows, desc := o.eqMerge(o.rng.Intn(2) == 0 && o.cols[1].typ != iceberg.PrimitiveTypes.Float64)
 			o.ops = append(o.ops, "go "+desc)
@@ -689,6 +807,47 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 			if eqAfter-eqBefore != len(keys) {
 				return fail("total-equality-deletes went %d -> %d, but the op wrote %d keys", eqBefore, eqAfter, len(keys))
 			}
+		case op < 95:
+			before, err := livePaths(s.ctx, tbl)
+			if err != nil {
+				return fail("plan: %v", err)
+			}
+			rows, picked, _ := o.pickRows(false)
+			o.ops = append(o.ops, fmt.Sprintf("go append %d duplicate + %d new keys %v, then dedupe", len(picked), len(rows)-len(picked), picked))
+			ids := map[int64]bool{}
+			for _, id := range picked {
+				ids[id] = true
+			}
+			arrSchema, err := table.SchemaToArrowSchema(tbl.Schema(), nil, true, false)
+			if err != nil {
+				return fail("arrow schema: %v", err)
+			}
+			rec, err := recordFromRows(arrSchema, rows)
+			if err != nil {
+				return fail("build arrow: %v", err)
+			}
+			rdr, err := array.NewRecordReader(arrSchema, []arrow.RecordBatch{rec})
+			rec.Release()
+			if err != nil {
+				return fail("reader: %v", err)
+			}
+			tbl, err = tbl.Append(s.ctx, rdr, nil)
+			rdr.Release()
+			if err != nil {
+				return fail("dedupe append: %v", err)
+			}
+			after, err := livePaths(s.ctx, tbl)
+			if err != nil {
+				return fail("plan: %v", err)
+			}
+			for p := range before {
+				delete(after, p)
+			}
+			var n int
+			if tbl, n, err = dedupeRewrite(s.ctx, tbl, after, ids); err != nil {
+				return fail("dedupe: %v", err)
+			}
+			o.ops[len(o.ops)-1] += fmt.Sprintf(" rewrote %d files", n)
 		default:
 			c := oracleCol{fmt.Sprintf("c%d", len(o.cols)-1), oracleTypes[o.rng.Intn(len(oracleTypes))]}
 			o.ops = append(o.ops, fmt.Sprintf("add column %s %s", c.name, c.typ))
