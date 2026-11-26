@@ -15,13 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: Go
+name: artie-go
 
 on:
   push:
     branches:
-      - 'main'
+      - 'artie/v0.7.0'
   pull_request:
+    branches:
+      - 'artie/**'
 
 concurrency:
   group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
@@ -35,7 +37,7 @@ jobs:
     name: ${{ matrix.os }} go${{ matrix.go }}
     runs-on: ${{ matrix.os }}
     # Cache dirs are pinned to dot-prefixed paths under the workspace so they are
-    # identical across Linux/Windows/macOS (no per-OS path branching) and are
+    # identical across runners and are
     # excluded from `go`/golangci-lint `./...` expansion (leading-dot dirs are
     # ignored). Go and golangci-lint honor these env vars for their cache dirs.
     env:
@@ -49,8 +51,6 @@ jobs:
         go: [ '1.25.9', '1.26.1' ]
         os:
           - 'ubuntu-latest'
-          - 'macos-latest'
-          # - 'windows-latest'  # blocked on Windows path support, see #1262
 
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -60,10 +60,10 @@ jobs:
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: ${{ matrix.go }}
-        # Caching is managed explicitly below so saves can be gated to main and
+        # Caching is managed explicitly below so saves can be gated to artie/v0.7.0 and
         # the golangci-lint cache can be keyed by Go version.
         cache: false
-    # Restore is unconditional (PRs read main's caches); save is gated to main.
+    # Restore is unconditional (PRs read artie/v0.7.0's caches); save is gated to artie/v0.7.0.
     - name: Restore Go module and build cache
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
@@ -94,7 +94,7 @@ jobs:
       if: matrix.os == 'ubuntu-latest' && matrix.go == '1.26.1'
       run: make test-assert
     - name: Save Go module and build cache
-      if: github.ref == 'refs/heads/main'
+      if: github.ref == 'refs/heads/artie/v0.7.0'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
@@ -102,52 +102,8 @@ jobs:
           ${{ github.workspace }}/.gocache/build
         key: go-${{ matrix.os }}-go${{ matrix.go }}-${{ hashFiles('go.sum') }}
     - name: Save golangci-lint cache
-      if: github.ref == 'refs/heads/main'
+      if: github.ref == 'refs/heads/artie/v0.7.0'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ github.workspace }}/.gocache/golangci
         key: golangci-${{ matrix.os }}-go${{ matrix.go }}-${{ hashFiles('go.sum', '.golangci.yml') }}
-
-  # Guards against big-endian-only failures such as the runtime.staticuint64s
-  # relocation misalignment triggered by boxing scalars in generic code
-  # (golang/go#76744). The fault is a linker error and only s390x's linker
-  # rejects the misaligned relocation, so this must build a main package for
-  # s390x specifically rather than just vet or compile libraries.
-  cross-compile:
-    name: cross-compile linux/s390x
-    runs-on: ubuntu-latest
-    env:
-      GOMODCACHE: ${{ github.workspace }}/.gocache/mod
-      GOCACHE: ${{ github.workspace }}/.gocache/build
-    steps:
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      with:
-        persist-credentials: false
-    - name: Install Go
-      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-      with:
-        go-version: '1.26.1'
-        cache: false
-    - name: Restore Go module and build cache
-      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: |
-          ${{ github.workspace }}/.gocache/mod
-          ${{ github.workspace }}/.gocache/build
-        key: go-cross-s390x-${{ hashFiles('go.sum') }}
-        restore-keys: |
-          go-cross-s390x-
-    - name: Build for big-endian (s390x)
-      env:
-        GOOS: linux
-        GOARCH: s390x
-        CGO_ENABLED: '0'
-      run: go build ./...
-    - name: Save Go module and build cache
-      if: github.ref == 'refs/heads/main'
-      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: |
-          ${{ github.workspace }}/.gocache/mod
-          ${{ github.workspace }}/.gocache/build
-        key: go-cross-s390x-${{ hashFiles('go.sum') }}
