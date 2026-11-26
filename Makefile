@@ -17,7 +17,7 @@
 # golangci-lint version (keep in sync with CI and README)
 GOLANGCI_LINT_VERSION := v2.14.0
 
-.PHONY: test test-assert test-race vet lint lint-install integration-setup integration-setup-spark4 integration-test integration-scanner integration-io integration-rest integration-rest-scan-planning integration-setup-polaris integration-external-rest integration-spark integration-hadoop integration-dynamodb integration-down integration-logs docs-gen
+.PHONY: test test-assert test-race vet lint lint-install integration-setup integration-setup-spark4 integration-test integration-scanner integration-io integration-rest integration-rest-scan-planning integration-setup-polaris integration-external-rest integration-spark integration-oracle integration-hadoop integration-dynamodb integration-down integration-logs docs-gen
 
 test:
 	go test -v ./...
@@ -102,6 +102,9 @@ integration-external-rest:
 
 integration-spark:
 	go test -tags=integration -v -run="^TestSparkIntegration" ./table
+
+integration-oracle:
+	go test -tags=integration -count=1 -v -run="^TestSparkIntegration$$/^TestRoundTripOracle$$" ./table
 
 DYNAMODB_ENDPOINT ?= http://localhost:8000
 
