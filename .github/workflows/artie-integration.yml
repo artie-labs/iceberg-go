@@ -15,13 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: "Go Integration"
+name: artie-integration
 
 on:
   push:
     branches:
-      - 'main'
+      - 'artie/v0.7.0'
   pull_request:
+    branches:
+      - 'artie/**'
 
 concurrency:
   group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
@@ -33,7 +35,7 @@ permissions:
 jobs:
   integration-test:
     runs-on: ubuntu-latest
-    # Cache dirs pinned under the workspace; saves are gated to main below.
+    # Cache dirs pinned under the workspace; saves are gated to artie/v0.7.0 below.
     env:
       GOMODCACHE: ${{ github.workspace }}/.gocache/mod
       GOCACHE: ${{ github.workspace }}/.gocache/build
@@ -52,7 +54,7 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.25
-          # Caching managed explicitly below so saves can be gated to main.
+          # Caching managed explicitly below so saves can be gated to artie/v0.7.0.
           cache: false
 
       - name: Restore Go module and build cache
@@ -88,7 +90,7 @@ jobs:
         run: docker compose -f internal/recipe/docker-compose.yml logs
 
       - name: Save Go module and build cache
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/artie/v0.7.0'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
