@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -303,7 +304,7 @@ func TestLazyEqualityDeleteLoaderLoadsFilesOnDemand(t *testing.T) {
 	combined, err := loader.load(t.Context(), tasks[1])
 	require.NoError(t, err)
 	require.Len(t, combined, 1)
-	assert.Len(t, combined[0].keys, 4)
+	assert.Len(t, allEqualityDeleteKeys(combined[0]), 4)
 	assert.Equal(t, int64(2), fs.opens.Load())
 	assert.Equal(t, int64(2), fs.attempts.Load())
 
@@ -1008,11 +1009,11 @@ func TestBuildEqualityDeleteSetsPerTaskSharesIdenticalSets(t *testing.T) {
 	assert.Same(t, perTask[2][0], perTask[3][0])
 	assert.Same(t, perTask[2][0], perTask[4][0])
 	assert.NotSame(t, perTask[2][0], perTask[5][0])
-	assert.Equal(t, set[string]{"a": {}, "b": {}}, perTask[2][0].keys)
-	assert.Equal(t, set[string]{"a": {}, "c": {}}, perTask[5][0].keys)
+	assert.Equal(t, set[string]{"a": {}, "b": {}}, allEqualityDeleteKeys(perTask[2][0]))
+	assert.Equal(t, set[string]{"a": {}, "c": {}}, allEqualityDeleteKeys(perTask[5][0]))
 }
 
-func TestMergeEqualityDeleteSetsClonesLargestInput(t *testing.T) {
+func TestMergeEqualityDeleteSetsSharesFileKeys(t *testing.T) {
 	largest := &equalityDeleteFileSet{equalityDeleteSet: &equalityDeleteSet{
 		keys:     set[string]{"a": {}, "b": {}, "c": {}},
 		fieldIDs: []int{1},
@@ -1023,12 +1024,79 @@ func TestMergeEqualityDeleteSetsClonesLargestInput(t *testing.T) {
 		fieldIDs: []int{1},
 		colNames: []string{"id"},
 	}}
+	emptyFile := &equalityDeleteFileSet{equalityDeleteSet: &equalityDeleteSet{
+		keys:     set[string]{},
+		fieldIDs: []int{1},
+		colNames: []string{"id"},
+	}}
 
-	merged := mergeEqualityDeleteSets([]*equalityDeleteFileSet{smaller, largest})
-	assert.Equal(t, set[string]{"a": {}, "b": {}, "c": {}, "d": {}}, merged.keys)
+	merged := mergeEqualityDeleteSets([]*equalityDeleteFileSet{smaller, emptyFile, largest})
+	assert.Equal(t, set[string]{"a": {}, "b": {}, "c": {}, "d": {}}, allEqualityDeleteKeys(merged))
+	for _, key := range []string{"a", "b", "c", "d"} {
+		assert.True(t, merged.has(key), key)
+	}
+	assert.False(t, merged.has("e"))
+	assert.False(t, merged.empty())
 
-	merged.keys["new"] = struct{}{}
-	assert.NotContains(t, largest.keys, "new")
+	// The largest file's map is checked first, and no file's keys are copied.
+	assert.Equal(t, reflect.ValueOf(largest.keys).Pointer(), reflect.ValueOf(merged.keys).Pointer())
+	require.Len(t, merged.more, 1)
+	assert.Equal(t, reflect.ValueOf(smaller.keys).Pointer(), reflect.ValueOf(merged.more[0]).Pointer())
+}
+
+func TestBuildEqualityDeleteSetsPerTaskDoesNotCopyKeysPerGroup(t *testing.T) {
+	// Each data file sees only the deletes committed after it, so every task has a different group of delete files.
+	// Combined sets must reuse the files' maps; copying them grew with the square of the commits.
+	const commits = 20
+	perFile := map[string]*equalityDeleteFileSet{}
+	deleteFiles := make([]iceberg.DataFile, commits)
+	fileMaps := map[uintptr]bool{}
+	for i := range commits {
+		deleteFiles[i] = newEqualityDeleteSetAssemblyTestFile(t, fmt.Sprintf("delete-%d.parquet", i), []int{1})
+		keys := set[string]{fmt.Sprintf("key-%d", i): {}}
+		perFile[deleteFiles[i].FilePath()] = newEqualityDeleteFileSet(i, &equalityDeleteSet{
+			keys:     keys,
+			fieldIDs: []int{1},
+			colNames: []string{"id"},
+		})
+		fileMaps[reflect.ValueOf(keys).Pointer()] = true
+	}
+
+	tasks := make([]FileScanTask, commits)
+	for i := range commits {
+		tasks[i] = FileScanTask{EqualityDeleteFiles: deleteFiles[i:]}
+	}
+
+	perTask := buildEqualityDeleteSetsPerTask(tasks, perFile)
+	require.Len(t, perTask, commits)
+	for i := range commits {
+		require.Len(t, perTask[i], 1)
+		deleteSet := perTask[i][0]
+		assert.True(t, fileMaps[reflect.ValueOf(deleteSet.keys).Pointer()], "task %d copied its keys", i)
+		for _, keys := range deleteSet.more {
+			assert.True(t, fileMaps[reflect.ValueOf(keys).Pointer()], "task %d copied its keys", i)
+		}
+		assert.Len(t, allEqualityDeleteKeys(deleteSet), commits-i)
+		assert.True(t, deleteSet.has(fmt.Sprintf("key-%d", i)))
+		if i > 0 {
+			assert.False(t, deleteSet.has(fmt.Sprintf("key-%d", i-1)))
+		}
+	}
+}
+
+// allEqualityDeleteKeys returns every key of s, across all of its delete files.
+func allEqualityDeleteKeys(s *equalityDeleteSet) set[string] {
+	keys := set[string]{}
+	for key := range s.keys {
+		keys[key] = struct{}{}
+	}
+	for _, more := range s.more {
+		for key := range more {
+			keys[key] = struct{}{}
+		}
+	}
+
+	return keys
 }
 
 func TestBuildEqualityDeleteSetsPerTaskKeepsFieldGroupsSeparate(t *testing.T) {
@@ -1074,8 +1142,8 @@ func TestBuildEqualityDeleteSetsPerTaskKeepsFieldGroupsSeparate(t *testing.T) {
 			setsByFieldID[deleteSet.fieldIDs[0]] = deleteSet
 		}
 
-		assert.Equal(t, wantIDs, setsByFieldID[1].keys)
-		assert.Equal(t, set[string]{"category": {}}, setsByFieldID[2].keys)
+		assert.Equal(t, wantIDs, allEqualityDeleteKeys(setsByFieldID[1]))
+		assert.Equal(t, set[string]{"category": {}}, allEqualityDeleteKeys(setsByFieldID[2]))
 	}
 }
 

@@ -21,8 +21,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"math"
+	"runtime"
 	"testing"
+	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet"
@@ -880,4 +883,75 @@ func TestCheckNoUnknownTransformInSpecs(t *testing.T) {
 		}
 		require.NoError(t, checkNoUnknownTransformInSpecs(meta, files))
 	})
+}
+
+// An early error must leave the records unread: a delete's records come from a scan that starts only once they are
+// ranged (see makePositionDeleteRecordsForFilter), so reading them here would run that scan for nothing.
+func TestPositionDeleteRecordsToDataFilesLeavesRecordsUnreadOnError(t *testing.T) {
+	unknown, err := iceberg.ParseTransform("custom_transform[42]")
+	require.NoError(t, err)
+
+	tableSchema := schema()
+	unknownSpec := iceberg.NewPartitionSpec(iceberg.PartitionField{
+		SourceIDs: []int{2}, FieldID: 1000, Name: "y_custom", Transform: unknown,
+	})
+	builder, err := NewMetadataBuilder(2)
+	require.NoError(t, err)
+	require.NoError(t, builder.SetLoc("s3://bucket/test/location"))
+	require.NoError(t, builder.AddSchema(&tableSchema))
+	require.NoError(t, builder.SetCurrentSchemaID(-1))
+	sortOrder := sortOrder()
+	require.NoError(t, builder.AddSortOrder(&sortOrder))
+	require.NoError(t, builder.SetDefaultSortOrderID(-1))
+	require.NoError(t, builder.AddPartitionSpec(&unknownSpec, true))
+	require.NoError(t, builder.SetDefaultSpecID(-1))
+
+	started := false
+	records := func(yield func(arrow.RecordBatch, error) bool) {
+		started = true
+	}
+
+	seq := positionDeleteRecordsToDataFiles(t.Context(), "mem://test", builder, nil, recordWritingArgs{
+		sc:  PositionalDeleteArrowSchema,
+		itr: records,
+	})
+	var errs []error
+	for _, err := range seq {
+		errs = append(errs, err)
+	}
+	require.Len(t, errs, 1)
+	require.ErrorIs(t, errs[0], iceberg.ErrInvalidTransform)
+	assert.False(t, started, "the records must not be read")
+}
+
+// writeFiles can fail creating its writer before it ranges its tasks. Nothing may be left running then: the records
+// stay unread, so a merge-on-read delete's scan never starts, and the file counter is never pulled, so no pull is left
+// unstopped.
+func TestPositionDeleteRecordsToDataFilesWriterErrorLeavesNothingRunning(t *testing.T) {
+	builder := newPositionDeleteUnpartitionedMetadata(t, 2)
+	require.NoError(t, builder.SetProperties(iceberg.Properties{WriteFormatDefaultKey: "bogus"}))
+
+	started := false
+	records := func(yield func(arrow.RecordBatch, error) bool) {
+		started = true
+	}
+
+	before := runtime.NumGoroutine()
+	var errs []error
+	for _, err := range positionDeleteRecordsToDataFiles(t.Context(), "file:///pos-delete-test", builder,
+		unpartitionedContexts("file:///pos-delete-test/data/a.parquet"), recordWritingArgs{
+			sc:  PositionalDeleteArrowSchema,
+			itr: records,
+		}) {
+		errs = append(errs, err)
+	}
+	require.Len(t, errs, 1)
+	require.ErrorContains(t, errs[0], "bogus")
+	assert.False(t, started, "the records must not be read")
+	// Polled by hand: assert.Eventually runs its condition on a goroutine of its own.
+	after := runtime.NumGoroutine()
+	for deadline := time.Now().Add(time.Second); after > before && time.Now().Before(deadline); after = runtime.NumGoroutine() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	assert.LessOrEqual(t, after, before, "no goroutine may be left running")
 }

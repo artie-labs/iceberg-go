@@ -591,3 +591,49 @@ func TestCreateIteratorStopsWhenConsumerStops(t *testing.T) {
 		t.Fatal("iterator did not stop after consumer termination")
 	}
 }
+
+// A merge-on-read delete builds its scan before writing anything, and an error in between used to leave the scan's
+// workers blocked forever. The scan now reads nothing and starts no worker until its records are ranged.
+func TestMergeOnReadDeleteScanStartsOnlyWhenRead(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	defer mem.AssertSize(t, 0)
+	ctx := compute.WithAllocator(t.Context(), mem)
+
+	schema := iceberg.NewSchema(1, iceberg.NestedField{
+		ID: 1, Name: "value", Type: iceberg.PrimitiveTypes.Int64, Required: true,
+	})
+	metadata, err := NewMetadata(schema, iceberg.UnpartitionedSpec,
+		UnsortedSortOrder, "mem://bucket/table", iceberg.Properties{PropertyFormatVersion: "2"})
+	require.NoError(t, err)
+
+	const (
+		dataPath   = "mem://bucket/data/a.parquet"
+		deletePath = "mem://bucket/deletes/a.parquet"
+	)
+	memFS := &countingOpenMemFS{MemFS: iceio.NewMemFS()}
+	dataFile := writeLazyDataParquetToMemFS(t, memFS.MemFS, dataPath, 0, 4)
+	writePosDeleteParquetToMemFS(t, memFS.MemFS, deletePath, `[{"file_path":"`+dataPath+`","pos":1}]`)
+	existing := map[string][]iceberg.DataFile{dataPath: {newPosDeleteFile(t, deletePath, 1, 128)}}
+
+	tbl := New(Identifier{"db", "lazy"}, metadata, "mem://bucket/table/metadata/v1.metadata.json",
+		func(context.Context) (iceio.IO, error) { return memFS, nil }, nil)
+	txn := tbl.NewTransaction()
+
+	// value 1 is position 1, already deleted; value 2 is position 2.
+	filter := iceberg.IsIn(iceberg.Reference("value"), int64(1), int64(2))
+	records, err := txn.makePositionDeleteRecordsForFilter(ctx, memFS, []iceberg.DataFile{dataFile}, existing, filter, true, 2, nil)
+	require.NoError(t, err)
+	assert.Zero(t, memFS.opens.Load(), "building the scan must not read any file")
+
+	var positions []int64
+	for record, err := range records {
+		require.NoError(t, err)
+		column := record.Column(1).(*array.Int64)
+		for i := range column.Len() {
+			positions = append(positions, column.Value(i))
+		}
+		record.Release()
+	}
+	assert.Equal(t, []int64{2}, positions, "only the row not already deleted gets a position delete")
+	assert.Equal(t, int64(2), memFS.opens.Load(), "reading opens the delete file and the data file")
+}

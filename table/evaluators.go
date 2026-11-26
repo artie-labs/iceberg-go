@@ -870,7 +870,9 @@ func (m *inclusiveMetricsEval) TestRowGroup(rgmeta *metadata.RowGroupMetaData, c
 		}
 
 		fieldID := int(stats.Descr().SchemaNode().FieldID())
-		m.valueCounts[fieldID] = stats.NumValues()
+		// Iceberg value counts include nulls. stats.NumValues() counts only non-null values, so a row group with as
+		// many nulls as values would look all-null and be skipped.
+		m.valueCounts[fieldID] = colMeta.NumValues()
 		if stats.HasNullCount() {
 			m.nullCounts[fieldID] = stats.NullCount()
 		}
