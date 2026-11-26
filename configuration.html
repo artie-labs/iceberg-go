@@ -255,12 +255,12 @@ catalog:
 <div class="table-wrapper"><table><thead><tr><th>Key</th><th>Purpose</th></tr></thead><tbody>
 <tr><td><code>default-catalog</code></td><td>Name used when <code>--catalog-name</code> is not passed on the CLI.</td></tr>
 <tr><td><code>max-workers</code></td><td>Worker pool size for concurrent operations. Default <code>5</code>.</td></tr>
-<tr><td><code>catalog.&lt;name&gt;.type</code></td><td>One of <code>rest</code>, <code>hive</code>, <code>glue</code>, <code>sql</code>, <code>hadoop</code>. <code>dynamodb</code> is recognized by the CLI but not implemented yet.</td></tr>
+<tr><td><code>catalog.&lt;name&gt;.type</code></td><td>One of <code>rest</code>, <code>hive</code>, <code>glue</code>, <code>sql</code>, <code>hadoop</code>, <code>dynamodb</code>.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.uri</code></td><td>Catalog endpoint or DSN.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.warehouse</code></td><td>Warehouse identifier (REST/Glue) or location (Hive/SQL).</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.credential</code></td><td>Credential string passed through to the catalog's auth handler.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.output</code></td><td>CLI output format (e.g. <code>text</code>, <code>json</code>).</td></tr>
-<tr><td><code>catalog.&lt;name&gt;.aws-profile</code></td><td>AWS named profile for the Glue catalog. When unset, the AWS SDK default credential chain is used.</td></tr>
+<tr><td><code>catalog.&lt;name&gt;.aws-profile</code></td><td>AWS named profile for Glue and DynamoDB catalogs. When unset, the AWS SDK default credential chain is used.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.sql-driver</code></td><td><code>database/sql</code> driver name for the SQL catalog. Maps to the <code>sql.driver</code> property. The default CLI binary only compiles in <code>sqliteshim</code>; other drivers require a custom build.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.sql-dialect</code></td><td>SQL dialect for the SQL catalog (<code>postgres</code>, <code>mysql</code>, <code>sqlite</code>, <code>mssql</code>, <code>oracle</code>). Maps to the <code>sql.dialect</code> property. The default CLI binary only ships <code>sqlite</code> via <code>sqliteshim</code>; other dialects need a custom build with their drivers.</td></tr>
 <tr><td><code>catalog.&lt;name&gt;.rest.sigv4-enabled</code></td><td>Enable AWS SigV4 signing for REST. When enabled, requests are signed with the <code>s3.*</code> credential properties if set (<code>s3.access-key-id</code> / <code>s3.secret-access-key</code> / <code>s3.session-token</code>), otherwise with the AWS default credential chain. The Java-client names (<code>rest.access-key-id</code> / <code>rest.secret-access-key</code> / <code>rest.session-token</code>) are accepted as aliases, resolved per field with the <code>s3.*</code> keys taking precedence.</td></tr>
@@ -272,8 +272,18 @@ catalog:
 <p>Each catalog package exposes its own functional <code>Option</code> set. The lists below reflect the public option surface; <code>pkg.go.dev</code> is authoritative for the current set.</p>
 <h3 id="rest-catalogrest"><a class="header" href="#rest-catalogrest">REST (<code>catalog/rest</code>)</a></h3>
 <p>The most option-rich surface. Source: <a href="https://github.com/apache/iceberg-go/blob/main/catalog/rest/options.go"><code>catalog/rest/options.go</code></a>.</p>
+<p>When <code>GET /v1/config</code> returns a non-null <code>idempotency-key-lifetime</code>, the client
+sends fresh UUIDv7 <code>Idempotency-Key</code> headers on namespace, table, view and
+transaction mutations, including create view, and on scan cancellation. After
+negotiation, a configured default <code>Idempotency-Key</code> is dropped from all requests
+when the server advertises a lifetime; the initial <code>GET /v1/config</code> may still
+carry it because advertisement is not yet known. Scan plan and task requests
+send keys independently of this advertisement and have a separate retry policy.
+Go's standard HTTP transport may replay certain failed requests on reused
+connections with the same key. The advertised lifetime is not currently enforced,
+including zero or malformed values.</p>
 <div class="table-wrapper"><table><thead><tr><th>Group</th><th>Options</th></tr></thead><tbody>
-<tr><td>Authentication</td><td><code>WithCredential</code>, <code>WithOAuthToken</code>, <code>WithAuthManager</code>, <code>NewOauth2AuthManager</code>, <code>WithAuthURI</code>, <code>WithScope</code>, <code>WithAudience</code>, <code>WithResource</code></td></tr>
+<tr><td>Authentication</td><td><code>WithCredential</code>, <code>WithOAuthToken</code>, <code>WithAuthManager</code>, <code>NewOAuth2AuthManager</code>, <code>WithAuthURI</code>, <code>WithScope</code>, <code>WithAudience</code>, <code>WithResource</code></td></tr>
 <tr><td>AWS SigV4</td><td><code>WithSigV4</code>, <code>WithSigV4RegionSvc</code>, <code>WithSigner</code></td></tr>
 <tr><td>HTTP</td><td><code>WithHeaders</code>, <code>WithTLSConfig</code>, <code>WithOAuthTLSConfig</code>, <code>WithCustomTransport</code></td></tr>
 <tr><td>Catalog routing</td><td><code>WithPrefix</code>, <code>WithWarehouseLocation</code>, <code>WithMetadataLocation</code></td></tr>
@@ -304,26 +314,93 @@ that loads a REST catalog with <code>rest.sigv4-enabled=true</code> now fails at
 until the <code>catalog/rest/sigv4</code> backend is blank-imported; the error names the
 import to add.</p>
 </blockquote>
-<h4 id="custom-token-sources-google-biglake"><a class="header" href="#custom-token-sources-google-biglake">Custom token sources (Google BigLake)</a></h4>
+<h4 id="conditional-table-loads"><a class="header" href="#conditional-table-loads">Conditional table loads</a></h4>
+<p>When a load returns an <code>ETag</code>, the REST catalog caches the response and sends
+<code>If-None-Match</code> on subsequent loads of the same table in the same snapshot
+loading mode. On a 304 response, it builds the table from the cached response.
+The expiry interval starts when the response is cached.</p>
+<div class="table-wrapper"><table><thead><tr><th>Property</th><th>Default</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>rest-table-cache.max-entries</code></td><td>100</td><td>Maximum cached table responses. Use 0 to disable the cache.</td></tr>
+<tr><td><code>rest-table-cache.expire-after-write-ms</code></td><td>300000</td><td>Time a cached response can be reused, in milliseconds.</td></tr>
+</tbody></table>
+</div>
+<p>The default <code>User-Agent</code> has the form <code>iceberg-go/&lt;version&gt; (go &lt;version&gt;)</code>.
+Set <code>User-Agent</code> with <code>WithHeaders</code> to override it.</p>
+<h4 id="authentication-type"><a class="header" href="#authentication-type">Authentication type</a></h4>
+<p>The <code>rest.auth.type</code> property selects how the client authenticates, as in Iceberg
+Java. It is read only from the properties the client supplies; a server's
+<code>/v1/config</code> defaults and overrides can't change it. An <code>AuthManager</code> passed with
+<code>WithAuthManager</code> takes precedence over it.</p>
+<div class="table-wrapper"><table><thead><tr><th>Value</th><th>Behavior</th></tr></thead><tbody>
+<tr><td>unset or <code>oauth2</code></td><td>Use <code>token</code>, or the client-credentials flow with <code>credential</code>. With neither, send no authorization header.</td></tr>
+<tr><td><code>none</code></td><td>Send no authorization header, even if <code>token</code> or <code>credential</code> is set.</td></tr>
+<tr><td><code>basic</code></td><td>HTTP Basic authentication with <code>rest.auth.basic.username</code> and <code>rest.auth.basic.password</code>, both required. Like <code>rest.auth.type</code>, they are read only from the client's properties.</td></tr>
+<tr><td><code>sigv4</code></td><td>Sign every request with AWS SigV4 and authenticate with the type in <code>rest.auth.sigv4.delegate-auth-type</code> (default <code>oauth2</code>; <code>sigv4</code> is rejected). Requires a blank import of <code>catalog/rest/sigv4</code>. Unlike <code>rest.sigv4-enabled</code>, a server override can't turn this signing off.</td></tr>
+<tr><td><code>google</code></td><td>Google credentials, for catalogs such as BigLake. Requires a blank import of <code>catalog/rest/googleauth</code>.</td></tr>
+</tbody></table>
+</div>
+<p>Other values select an auth manager registered with <code>rest.RegisterAuthManager</code>.
+An unregistered value fails <code>NewCatalog</code> / <code>catalog.Load</code>.</p>
+<p>When SigV4 signs a request that already carries an <code>Authorization</code> header, such
+as the <code>oauth2</code> or <code>basic</code> header of the delegate auth type, the header moves to
+<code>Original-Authorization</code> and is signed with the request, as in Java. This also
+applies to <code>rest.sigv4-enabled</code>.</p>
+<h4 id="google-biglake"><a class="header" href="#google-biglake">Google BigLake</a></h4>
+<p>With <code>rest.auth.type=google</code>, the
+<a href="https://github.com/apache/iceberg-go/blob/main/catalog/rest/googleauth/googleauth.go"><code>catalog/rest/googleauth</code></a>
+backend authenticates with Google credentials, using the same properties as
+Java's <code>GoogleAuthManager</code>:</p>
+<div class="table-wrapper"><table><thead><tr><th>Property</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>gcp.auth.credentials-path</code></td><td>Path to a credentials JSON file, such as a service account key.</td></tr>
+<tr><td><code>gcp.auth.credentials-json</code></td><td>The same JSON, inline. Setting both is an error.</td></tr>
+<tr><td><code>gcp.auth.scopes</code></td><td>Comma-separated OAuth scopes. Default <code>https://www.googleapis.com/auth/cloud-platform</code>.</td></tr>
+</tbody></table>
+</div>
+<p>Without either credentials property, Application Default Credentials are used.
+Like <code>rest.auth.type</code>, these are read only from the client's properties.</p>
+<p>Token requests don't go through the catalog's HTTP client, so a transport, TLS
+config or proxy set with <code>WithCustomTransport</code>, <code>WithTLSConfig</code> or
+<code>WithTransportFactory</code> doesn't apply to them, as in Java. They use a client with
+the default transport and a 60-second timeout. To use a specific client, put it
+in the context's <code>oauth2.HTTPClient</code> value when loading the catalog, or build
+the token source yourself (for example with <code>googleauth.TokenSource</code>) and pass
+<code>NewOAuth2AuthManager(ts)</code> to <code>WithAuthManager</code>. One exception: on Google Cloud
+compute, Application Default Credentials come from the metadata server, which
+the Google library always reaches through its own client.</p>
+<pre><code class="language-go">import (
+	&quot;github.com/apache/iceberg-go&quot;
+	&quot;github.com/apache/iceberg-go/catalog&quot;
+	_ &quot;github.com/apache/iceberg-go/catalog/rest/googleauth&quot;
+)
+
+cat, err := catalog.Load(ctx, &quot;biglake&quot;, iceberg.Properties{
+	&quot;type&quot;:                       &quot;rest&quot;,
+	&quot;uri&quot;:                        &quot;https://biglake.googleapis.com/iceberg/v1/restcatalog&quot;,
+	&quot;warehouse&quot;:                  &quot;gs://lakehouse-public-data&quot;,
+	&quot;rest.auth.type&quot;:             &quot;google&quot;,
+	&quot;header.x-goog-user-project&quot;: &quot;my-project&quot;,
+})
+</code></pre>
+<h4 id="custom-token-sources"><a class="header" href="#custom-token-sources">Custom token sources</a></h4>
 <p><code>WithCredential</code> uses the OAuth2 client-credentials flow against the catalog's
 token endpoint. For other identity providers, wrap any <code>oauth2.TokenSource</code> with
-<code>NewOauth2AuthManager</code> and pass it to <code>WithAuthManager</code>. Google's BigLake Iceberg
-REST catalog, for example, takes Application Default Credentials:</p>
+<code>NewOAuth2AuthManager</code> and pass it to <code>WithAuthManager</code>. The Google setup above
+can also be written this way:</p>
 <pre><code class="language-go">ts, err := google.DefaultTokenSource(ctx, &quot;https://www.googleapis.com/auth/cloud-platform&quot;)
 if err != nil {
 	return err
 }
 cat, err := rest.NewCatalog(ctx, &quot;biglake&quot;, &quot;https://biglake.googleapis.com/iceberg/v1/restcatalog&quot;,
-	rest.WithAuthManager(rest.NewOauth2AuthManager(ts)),
+	rest.WithAuthManager(rest.NewOAuth2AuthManager(ts)),
 	rest.WithWarehouseLocation(&quot;gs://lakehouse-public-data&quot;),
 	rest.WithHeaders(map[string]string{&quot;x-goog-user-project&quot;: &quot;my-project&quot;}))
 </code></pre>
 <p>The manager reuses a token until it expires, then asks the source for a new one.
 That refresh runs on the HTTP client the source was built with. For
 <code>google.DefaultTokenSource</code> that is the client in the context's
-<code>oauth2.HTTPClient</code> value, or <code>http.DefaultClient</code>, which has no timeout.
-Unlike Java's <code>rest.auth.type=google</code>, this is configured in code; iceberg-go
-has no <code>rest.auth.type</code> property.</p>
+<code>oauth2.HTTPClient</code> value, or <code>http.DefaultClient</code>, which has no timeout. With
+<code>rest.auth.type=google</code>, the backend sets a client with a 60-second timeout
+unless the context already carries one.</p>
 <h4 id="metrics-reporting"><a class="header" href="#metrics-reporting">Metrics reporting</a></h4>
 <p>The REST catalog can POST scan and commit metrics to the catalog's
 <code>.../tables/{table}/metrics</code> endpoint. These properties are passed as
@@ -353,11 +430,13 @@ assume parity on it in multi-client deployments.</p>
 <li><code>WithURI(uri string)</code> - Thrift URI for the Hive Metastore (e.g. <code>thrift://127.0.0.1:9083</code>).</li>
 <li><code>WithWarehouse(warehouse string)</code></li>
 <li><code>WithProperties(props iceberg.Properties)</code></li>
+<li><code>WithIORegistry(registry *io.Registry)</code> - use a catalog-scoped FileIO registry.</li>
 </ul>
 <p>Lock-check catalog properties (passed via <code>WithProperties</code> / <code>catalog.Load</code> props):</p>
 <div class="table-wrapper"><table><thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>iceberg.hive.lock-check-min-wait-ms</code></td><td><code>50</code></td><td>Minimum wait between lock-status checks, in milliseconds. Matches the Java Hive catalog key.</td></tr>
 <tr><td><code>iceberg.hive.lock-check-max-wait-ms</code></td><td><code>5000</code></td><td>Maximum wait between lock-status checks, in milliseconds. Matches the Java Hive catalog key.</td></tr>
+<tr><td><code>iceberg.hive.lock-heartbeat-interval-ms</code></td><td><code>240000</code></td><td>Interval between view lock renewals, in milliseconds. Set it below the metastore lock timeout.</td></tr>
 <tr><td><code>lock-check-min-wait-time</code> / <code>lock-check-max-wait-time</code></td><td>same defaults</td><td>Legacy Go aliases that accept Go duration strings (e.g. <code>100ms</code>, <code>5s</code>). Ignored when the corresponding Java key is set.</td></tr>
 <tr><td><code>lock-check-retries</code></td><td><code>4</code></td><td>Go-specific upper bound on check attempts. Java instead uses <code>iceberg.hive.lock-timeout-ms</code> (not wired in Go yet).</td></tr>
 </tbody></table>
@@ -368,15 +447,38 @@ assume parity on it in multi-client deployments.</p>
 <ul>
 <li><code>WithAWSConfig(cfg aws.Config)</code> - AWS SDK v2 config; respects the AWS default credential chain.</li>
 <li><code>WithAWSProperties(props AWSProperties)</code> - catalog properties, such as <code>glue.id</code> and the <code>s3.*</code> FileIO keys. <code>NewCatalog</code> ignores the <code>glue.region</code>, endpoint, credential, and retry keys; only <code>catalog.Load</code> reads them.</li>
+<li><code>WithIORegistry(registry *io.Registry)</code> - use a catalog-scoped FileIO registry.</li>
 </ul>
+<p>For AWS Glue databases federated to Amazon S3 Tables, the service assigns the
+table location at creation. Omit the explicit location when creating these
+tables. The Glue catalog rejects rename requests for S3 Tables-managed tables.</p>
 <h3 id="sql-catalogsql"><a class="header" href="#sql-catalogsql">SQL (<code>catalog/sql</code>)</a></h3>
-<p>The SQL catalog has no functional-option surface. Construct it with <code>NewCatalog</code>:</p>
+<p>Pass <code>sqlcat.WithIORegistry(registry)</code> to <code>NewCatalog</code> to select isolated FileIO:</p>
 <pre><code class="language-go">db, _ := sql.Open(sqliteshim.ShimName, &quot;file:catalog.db&quot;)
-cat, err := sqlcat.NewCatalog(&quot;default&quot;, db, sqlcat.SQLite, iceberg.Properties{
+registry := io.NewRegistry() // copy currently registered global schemes
+cat, err := sqlcat.NewCatalog(ctx, &quot;default&quot;, db, sqlcat.SQLite, iceberg.Properties{
     &quot;warehouse&quot;: &quot;file:///tmp/warehouse&quot;,
-})
+}, sqlcat.WithIORegistry(registry)) // omit option for global FileIO
 </code></pre>
 <p>Supported dialects: <code>sqlcat.Postgres</code>, <code>sqlcat.MySQL</code>, <code>sqlcat.SQLite</code>, <code>sqlcat.MSSQL</code>, <code>sqlcat.Oracle</code> (<code>catalog/sql/sql.go:50</code>).</p>
+<p>SQL view operations require the V1 JDBC catalog schema. To migrate a legacy V0
+catalog, set <code>jdbc.schema-version=V1</code>. This one-way migration adds the
+<code>iceberg_type</code> column to the shared catalog table. Setting the property back
+to V0 does not reverse the migration.</p>
+<h3 id="dynamodb-catalogdynamodb"><a class="header" href="#dynamodb-catalogdynamodb">DynamoDB (<code>catalog/dynamodb</code>)</a></h3>
+<p>Blank-import <code>github.com/apache/iceberg-go/catalog/dynamodb</code> to register the
+backend, then use <code>type=dynamodb</code> with <code>catalog.Load</code>. The loader uses the AWS
+SDK default credential chain.</p>
+<div class="table-wrapper"><table><thead><tr><th>Property</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>warehouse</code></td><td>Required default table storage location.</td></tr>
+<tr><td><code>dynamodb.table-name</code></td><td>Backing DynamoDB table, default <code>iceberg</code>.</td></tr>
+<tr><td><code>dynamodb.endpoint</code></td><td>Optional endpoint, including DynamoDB Local.</td></tr>
+<tr><td><code>client.region</code></td><td>AWS region override.</td></tr>
+</tbody></table>
+</div>
+<p>Use separate backing tables for separate logical catalogs. See the
+<a href="https://github.com/apache/iceberg-go/blob/main/catalog/dynamodb/README.md">DynamoDB catalog guide</a>
+for namespace rules and coordination with other Iceberg clients.</p>
 <h3 id="shared-options-on-the-base-catalog-package"><a class="header" href="#shared-options-on-the-base-catalog-package">Shared options on the base <code>catalog</code> package</a></h3>
 <p>Operations that create or update tables/views accept these (<code>catalog/catalog.go</code>):</p>
 <ul>
@@ -393,7 +495,7 @@ import _ &quot;github.com/apache/iceberg-go/io/gocloud/azure&quot; // abfs, abfs
 <p>Without a matching blank import, these schemes return <code>ErrIOSchemeNotFound</code> with a hint naming the package to import.</p>
 <p>All credential and tuning property keys are constants in <a href="https://github.com/apache/iceberg-go/blob/main/io/config.go"><code>io/config.go</code></a>. They can be supplied through table properties, catalog properties, or per-call <code>iceberg.Properties</code> arguments depending on context.</p>
 <h3 id="s3"><a class="header" href="#s3">S3</a></h3>
-<p>Authentication is resolved in this order (<code>io/gocloud/s3/s3.go</code>):</p>
+<p>When remote signing is disabled, authentication is resolved in this order (<code>io/gocloud/s3/s3.go</code>):</p>
 <ol>
 <li>Static credentials in properties: <code>s3.access-key-id</code> + <code>s3.secret-access-key</code> (+ optional <code>s3.session-token</code>).</li>
 <li>The standard AWS SDK v2 default credential chain - environment variables (<code>AWS_ACCESS_KEY_ID</code>, <code>AWS_SECRET_ACCESS_KEY</code>, <code>AWS_SESSION_TOKEN</code>), <code>~/.aws/credentials</code>, container/IAM role.</li>
@@ -409,9 +511,33 @@ import _ &quot;github.com/apache/iceberg-go/io/gocloud/azure&quot; // abfs, abfs
 <tr><td><code>s3.connect-timeout</code> (<code>io.S3ConnectTimeout</code>)</td><td>Either a number of seconds (<code>&quot;60&quot;</code>, <code>&quot;60.0&quot;</code>) or a Go duration (<code>&quot;5s&quot;</code>).</td></tr>
 <tr><td><code>s3.force-virtual-addressing</code> (<code>io.S3ForceVirtualAddressing</code>)</td><td>Force virtual-host-style addressing.</td></tr>
 <tr><td><code>s3.compat-mode</code> (<code>io.S3CompatMode</code>)</td><td>Enable for non-AWS S3 endpoints. Defaults to off.</td></tr>
-<tr><td><code>s3.signer.uri</code> (<code>io.S3SignerURI</code>)</td><td>Reserved for remote-signing endpoint (not yet implemented).</td></tr>
+<tr><td><code>s3.remote-signing-enabled</code> (<code>io.S3RemoteSigningEnabled</code>)</td><td>Set to <code>true</code> to have a REST service sign S3 requests. Defaults to <code>false</code>.</td></tr>
+<tr><td><code>s3.signer.uri</code> (<code>io.S3SignerURI</code>)</td><td>Legacy signing service base URI. Requests use <code>&lt;base&gt;/v1/aws/s3/sign</code>.</td></tr>
 </tbody></table>
 </div>
+<p>With remote signing enabled, S3 uses anonymous SDK credentials and obtains each
+request's signature from the signing service. No local AWS credentials are needed.
+REST catalogs use the table's <code>/sign</code> endpoint by default and pass through the
+response's <code>remote-signing-config</code> headers and properties. When that config is
+present, legacy <code>signer.endpoint</code>, <code>signer.uri</code>, and <code>s3.signer.uri</code> settings
+are ignored. <code>rest.remote-signing.endpoint</code> can explicitly override the default.
+It may be an absolute URL or a path relative to the catalog URI.
+Legacy settings are supported when the response has no remote signing config.</p>
+<p>A table-specific token takes precedence over the catalog token. The catalog's
+refreshing authentication is reused only when the signer shares the catalog's
+origin. For a separate signing service, use the headers supplied in
+<code>remote-signing-config</code> or a table-specific token. For a standalone S3 FileIO,
+set <code>s3.signer.uri</code>, <code>s3.region</code>, and an optional <code>token</code> for the signing service.
+When also supplying <code>rest.remote-signing.config</code>, set
+<code>rest.remote-signing.endpoint</code> to the complete signing endpoint instead.</p>
+<p>Object uploads use unsigned payloads. Only bulk-delete XML bodies are sent to the
+signer. Streaming signatures (<code>aws-chunked</code>) are unsupported. Caller-supplied
+checksum values are preserved; an upload that sets <code>ChecksumAlgorithm</code> must also
+supply its checksum value. Signing requests use the caller's context and a
+30-second timeout unless the HTTP client has a configured timeout.
+Remote signing accepts a standard <code>*http.Client</code> or the AWS SDK's buildable client
+for S3 requests so redirects can be disabled. Other custom HTTP clients are rejected.
+S3 requests must resolve to SigV4; SigV4a and S3 Express signing are not supported.</p>
 <h3 id="google-cloud-storage"><a class="header" href="#google-cloud-storage">Google Cloud Storage</a></h3>
 <p>Authentication resolution (<code>io/gocloud/gcs/gcs.go</code>):</p>
 <ol>
@@ -458,7 +584,7 @@ selected.</p>
 <div class="table-wrapper"><table><thead><tr><th>Key (constant)</th><th>Purpose</th></tr></thead><tbody>
 <tr><td><code>adls.auth.shared-key.account.name</code> (<code>io.ADLSSharedKeyAccountName</code>)</td><td>Account name.</td></tr>
 <tr><td><code>adls.auth.shared-key.account.key</code> (<code>io.ADLSSharedKeyAccountKey</code>)</td><td>Account key.</td></tr>
-<tr><td><code>adls.sas-token.&lt;host&gt;</code> (prefix <code>io.ADLSSasTokenPrefix</code>)</td><td>Per-host SAS token.</td></tr>
+<tr><td><code>adls.sas-token.&lt;host&gt;</code> (prefix <code>io.ADLSSASTokenPrefix</code>)</td><td>Per-host SAS token.</td></tr>
 <tr><td><code>adls.connection-string.&lt;account-name&gt;</code> (prefix <code>io.ADLSConnectionStringPrefix</code>)</td><td>Per-account connection string.</td></tr>
 <tr><td><code>adls.token</code> (<code>io.ADLSToken</code>)</td><td>Static Azure Storage access token, without the <code>Bearer </code> prefix. Subject to the precedence above; not refreshed.</td></tr>
 <tr><td><code>adls.client-id</code> (<code>io.ADLSClientID</code>)</td><td>Client ID of a user-assigned managed identity. Used only when the explicit managed-identity authentication path is selected.</td></tr>
@@ -467,6 +593,16 @@ selected.</p>
 <tr><td><code>adls.auth.managed-identity.enabled</code> (<code>io.ADLSManagedIdentityEnabled</code>)</td><td>Set to exactly <code>&quot;true&quot;</code> to use <code>ManagedIdentityCredential</code> directly, subject to the precedence above.</td></tr>
 </tbody></table>
 </div>
+<h2 id="file-encryption-and-key-management"><a class="header" href="#file-encryption-and-key-management">File encryption and key management</a></h2>
+<p><code>encryption.StandardEncryptionManager</code> exposes an explicit API for
+Iceberg-compatible AES-GCM file encryption. Callers handle encryption and
+decryption separately from table scans and writes. The key metadata returned
+by the manager contains the raw data key. Persist it only in a protected
+location, such as encrypted parent metadata.</p>
+<p>To use AWS KMS for key wrapping, blank-import
+<code>github.com/apache/iceberg-go/encryption/awskms</code> and pass <code>kms-type=aws</code> to
+<code>encryption.LoadKeyManagementClient(ctx, props)</code>. The provider uses the AWS
+SDK credential chain and accepts <code>client.region</code> and <code>kms.endpoint</code>.</p>
 <h2 id="environment-variables"><a class="header" href="#environment-variables">Environment variables</a></h2>
 <p>iceberg-go reads only a small set of environment variables directly. AWS / GCP / Azure credentials flow through the respective SDKs, not through iceberg-go-defined env vars.</p>
 <div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Purpose</th><th>Read at</th></tr></thead><tbody>
@@ -504,7 +640,7 @@ func init() {
 <p><code>io.Register</code> and <code>io.MustRegister</code> both panic for invalid or duplicate global schemes, preserving the existing registration contract. <code>registry.Register</code> on an independent registry returns <code>ErrInvalidSchemeFactory</code> or <code>ErrSchemeAlreadyRegistered</code> instead. Built-in schemes: <code>file</code>, <code>&quot;&quot;</code> (the empty scheme).
 Cloud schemes (<code>s3</code>, <code>gs</code>, <code>abfs</code>, etc.) are registered only when the matching backend package under <code>io/gocloud</code> is blank-imported.</p>
 <p><code>io.GetRegisteredSchemes()</code> returns the current scheme list; <code>io.Unregister(scheme)</code> removes one.</p>
-<p>To register schemes at runtime without changing other users of the same process, create an independent registry (catalogs and <code>view.CreateView</code> still resolve through the default registry):</p>
+<p>To register schemes at runtime without changing other users of the same process, create an independent registry:</p>
 <pre><code class="language-go">registry := io.NewRegistry()
 if err := registry.Register(&quot;myfs&quot;, myFactory); err != nil {
     return err
@@ -512,6 +648,23 @@ if err := registry.Register(&quot;myfs&quot;, myFactory); err != nil {
 fs, err := registry.LoadFS(ctx, props, &quot;myfs://bucket/key&quot;)
 </code></pre>
 <p><code>io.NewRegistry()</code> copies schemes already registered globally (including blank-imported cloud backends) but keeps later registrations independent. <code>registry.Clone()</code> makes an isolated copy of another registry. <code>registry.Names()</code> lists the schemes registered in that instance. <code>registry.LoadFSFunc()</code> is the lazy factory equivalent. Global <code>io.LoadFS()</code> and <code>io.LoadFSFunc()</code> continue using the default registry.</p>
+<p>Pass the catalog's <code>WithIORegistry(registry)</code> option to <code>NewCatalog</code> in
+Glue, Hadoop, Hive, REST, or SQL. For direct view metadata creation or
+writes, pass <code>view.WithIORegistry(registry)</code> to the view helper.
+Omitting the option or passing nil uses the global registry. An empty
+non-nil registry has no registered schemes. A catalog-scoped registry does
+not affect <code>catalog.Load</code>, which uses the global registry with the built-in
+catalog registrars.</p>
+<p>The catalog holds the supplied registry, so registering or unregistering a
+scheme affects future FileIO resolutions. Hadoop opens its warehouse
+filesystem during construction and reuses it for warehouse operations.
+Use <code>registry.Clone()</code> to give another catalog its own set of schemes.</p>
+<p>View metadata creation accepts the same scoped registry option, but reading
+view metadata via <code>view.NewFromLocation</code> uses the filesystem factory explicitly
+passed by the caller. A catalog's own load and update methods supply their
+scoped factory. Passing credentials in <code>ioProps</code> configures the filesystem;
+only <code>metadataProps</code> are persisted in the view metadata.</p>
+<p>These FileIO options do not select a KMS implementation. <code>encryption.KMSRegistry</code> is separate; no catalog encryption path currently loads a KMS client.</p>
 <h3 id="catalog-type-registry"><a class="header" href="#catalog-type-registry">Catalog type registry</a></h3>
 <p>Register a custom catalog type with <a href="https://github.com/apache/iceberg-go/blob/main/catalog/registry.go"><code>catalog.Register</code></a>:</p>
 <pre><code class="language-go">import (
@@ -529,7 +682,7 @@ func init() {
     ))
 }
 </code></pre>
-<p>After registration, <code>catalog.Load(ctx, &quot;default&quot;, iceberg.Properties{&quot;type&quot;: &quot;mycatalog&quot;, ...})</code> will route to the factory. Custom catalogs must implement <code>Close() error</code> to satisfy <code>catalog.Catalog</code>, and callers must close them when finished. Built-in types: <code>rest</code>, <code>hive</code>, <code>glue</code>, <code>sql</code>, <code>hadoop</code>.</p>
+<p>After registration, <code>catalog.Load(ctx, &quot;default&quot;, iceberg.Properties{&quot;type&quot;: &quot;mycatalog&quot;, ...})</code> will route to the factory. Custom catalogs must implement <code>Close() error</code> to satisfy <code>catalog.Catalog</code>, and callers must close them when finished. Built-in types: <code>rest</code>, <code>hive</code>, <code>glue</code>, <code>sql</code>, <code>hadoop</code>, <code>dynamodb</code>.</p>
 <p><code>catalog.GetRegisteredCatalogs()</code> returns the current list; <code>catalog.Unregister(catalogType)</code> removes one.</p>
 <h3 id="locationprovider"><a class="header" href="#locationprovider">LocationProvider</a></h3>
 <p><a href="https://github.com/apache/iceberg-go/blob/main/table/locations.go"><code>table/locations.go</code></a> defines the <code>LocationProvider</code> interface and ships two implementations: <code>simpleLocationProvider</code> (default) and <code>objectStoreLocationProvider</code> (selected by <code>write.object-storage.enabled = true</code>). The provider is chosen by table properties and is not user-pluggable today.</p>
@@ -538,7 +691,8 @@ func init() {
 <h3 id="format-and-file-sizing"><a class="header" href="#format-and-file-sizing">Format and file sizing</a></h3>
 <div class="table-wrapper"><table><thead><tr><th>Key</th><th>Default</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>write.format.default</code></td><td><code>parquet</code></td><td>File format used when writing data files. Read in <code>table/writer.go</code> and <code>table/rolling_data_writer.go</code>.</td></tr>
-<tr><td><code>write.target-file-size-bytes</code></td><td>(set by writer)</td><td>Target size for newly written data files. Read in <code>table/arrow_utils.go</code> and <code>table/equality_delete_writer.go</code>.</td></tr>
+<tr><td><code>write.target-file-size-bytes</code></td><td><code>536870912</code> (512 MB)</td><td>Target size for newly written data files. Read in <code>table/arrow_utils.go</code>.</td></tr>
+<tr><td><code>write.delete.target-file-size-bytes</code></td><td><code>67108864</code> (64 MB)</td><td>Target size for equality-delete and v2 position-delete files where file rolling applies. Read in <code>table/equality_delete_writer.go</code> and <code>table/arrow_utils.go</code>.</td></tr>
 </tbody></table>
 </div>
 <h3 id="scan-reads"><a class="header" href="#scan-reads">Scan reads</a></h3>
@@ -627,20 +781,68 @@ but are reserved for future task-group planning and are not currently read.</p>
 <tr><td><code>write.parquet.page-version</code></td><td><code>2</code></td></tr>
 <tr><td><code>write.parquet.compression-codec</code></td><td><code>zstd</code></td></tr>
 <tr><td><code>write.parquet.compression-level</code></td><td><code>-1</code> (codec default)</td></tr>
+<tr><td><code>write.parquet.compression-codec.column.&lt;name&gt;</code></td><td>Global codec</td></tr>
+<tr><td><code>write.parquet.compression-level.column.&lt;name&gt;</code></td><td>Global level, or the column codec's default if the codecs differ</td></tr>
 <tr><td><code>write.parquet.bloom-filter-max-bytes</code></td><td>1 MB</td></tr>
 <tr><td><code>write.parquet.bloom-filter-enabled.column.&lt;name&gt;</code></td><td>(per-column toggle, prefix-matched)</td></tr>
+<tr><td><code>write.parquet.bloom-filter-fpp.column.&lt;name&gt;</code></td><td>0.01 (per-column false-positive probability, strictly between 0 and 1)</td></tr>
+<tr><td><code>write.parquet.bloom-filter-ndv.column.&lt;name&gt;</code></td><td>unset (expected distinct values; positive integer up to 4,294,967,295)</td></tr>
+<tr><td><code>write.parquet.bloom-filter-adaptive-enabled</code></td><td><code>false</code> (size enabled Bloom filters to observed NDV unless a per-column NDV is specified)</td></tr>
+<tr><td><code>write.parquet.stats-enabled.column.&lt;name&gt;</code></td><td><code>true</code> (per-column Parquet statistics toggle)</td></tr>
 <tr><td><code>parquet.enable.dictionary</code></td><td><code>true</code> (global dictionary encoding switch; same key as Iceberg Java)</td></tr>
 <tr><td><code>write.parquet.dict-encoding-enabled.column.&lt;name&gt;</code></td><td>(per-column toggle, prefix-matched; overrides the global switch)</td></tr>
 <tr><td><code>write.parquet.shred-variants</code></td><td><code>false</code> (opt-in shredding of top-level variant columns)</td></tr>
 <tr><td><code>write.parquet.variant-inference-buffer-size</code></td><td>100 rows (buffered per file to infer the shredding schema)</td></tr>
 </tbody></table>
 </div>
-<p>The bloom filter and dictionary toggles are parsed the way Iceberg Java parses them: only <code>true</code> (case-insensitive) enables, so any other value — including <code>1</code> — reads as <code>false</code>.</p>
+<p>The bloom filter, statistics, and dictionary toggles follow Iceberg Java parsing: only <code>true</code>
+(case-insensitive) enables a toggle; other values, including <code>1</code>, are false. Bloom filters remain
+disabled for a column unless its enabled toggle is set. When adaptive sizing is enabled, an explicit
+column NDV takes precedence. Adaptive sizing rejects FPP values extremely close to 1 that could make
+the writer hang.</p>
+<p>Statistics settings apply to data files and use Iceberg field names, including nested paths such as
+<code>items.element</code>. Disabling statistics can reduce pruning and omit some Iceberg file metrics; other
+metadata may still be recorded. Floating-point Iceberg file metrics can also include NaN value counts.</p>
+<p>Column compression keys use case-sensitive Iceberg leaf paths, such as
+<code>items.element</code> or <code>attributes.value.name</code>. They apply to data files and use
+the global settings for columns without overrides. An explicit column level
+must be an integer valid for its effective codec. Missing fields are ignored.
+Parquet variant leaves do not have Iceberg field IDs and cannot be selected by
+these keys. Arrow does not register legacy <code>lz4</code> or <code>lzo</code> codecs by default;
+<code>lz4_raw</code> is supported.
+Bloom column settings use Iceberg names, including <code>items.element</code> and
+<code>lookup.value</code>. Writers resolve these to the physical Parquet paths. Existing
+physical-path settings remain supported; logical names take precedence when
+both are present. Logical settings follow column renames and are removed when
+the column is deleted. Data-column Bloom settings do not apply to delete files.</p>
+<p>Equality-delete and v2 position-delete Parquet writers also support these
+overrides, defined in <code>table/properties.go</code>. Unset overrides inherit the
+corresponding <code>write.parquet.*</code> setting and its default. If the delete codec
+differs from the data codec and no delete level is set, the delete writer uses
+the codec's default level instead of inheriting the data codec's level.</p>
+<div class="table-wrapper"><table><thead><tr><th>Key</th><th>Overrides</th></tr></thead><tbody>
+<tr><td><code>write.delete.parquet.row-group-size-bytes</code></td><td>Row-group size target</td></tr>
+<tr><td><code>write.delete.parquet.page-size-bytes</code></td><td>Data page size</td></tr>
+<tr><td><code>write.delete.parquet.page-row-limit</code></td><td>Page write batch size</td></tr>
+<tr><td><code>write.delete.parquet.dict-size-bytes</code></td><td>Dictionary page size</td></tr>
+<tr><td><code>write.delete.parquet.page-version</code></td><td>Data page version: <code>v1</code> or <code>v2</code> (<code>1</code> and <code>2</code> also accepted)</td></tr>
+<tr><td><code>write.delete.parquet.compression-codec</code></td><td>Compression codec</td></tr>
+<tr><td><code>write.delete.parquet.compression-level</code></td><td>Compression level</td></tr>
+</tbody></table>
+</div>
+<p>As in Java, data-column Bloom filter and dictionary overrides do not apply to
+delete files. The global <code>parquet.enable.dictionary</code> switch still applies.
+Metrics configuration is independent: equality deletes use the table metrics
+settings, while position deletes always retain full <code>file_path</code> and <code>pos</code> bounds.</p>
 <h3 id="parquet-reader"><a class="header" href="#parquet-reader">Parquet reader</a></h3>
 <div class="table-wrapper"><table><thead><tr><th>Key</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>read.parquet.batch-size</code></td><td>Arrow record-batch size used by the Parquet reader.</td></tr>
+<tr><td><code>read.parquet.max-compressed-page-size-bytes</code></td><td>Maximum compressed page body. Default: 64 MiB.</td></tr>
+<tr><td><code>read.parquet.max-uncompressed-page-size-bytes</code></td><td>Maximum uncompressed page body. Default: 256 MiB.</td></tr>
 </tbody></table>
 </div>
+<p>The page limits are Go-specific reader settings; Iceberg Java ignores them. Explicit values must be integers from <code>1</code> to <code>2147483647</code>, the largest size representable in a Parquet page header. Table properties apply to scans, deletes, delete-file inspection and maintenance. A scan can override them through <code>table.WithOptions</code> without changing saved metadata. Compressed and uncompressed limits are independent; raising one does not raise the other.</p>
+
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
