@@ -70,6 +70,7 @@ type oracle struct {
 	rows    map[int64]map[string]any
 	nextID  int64
 	written int // rows ever written, old versions included
+	eqDead  int // rows removed by equality deletes and not yet given a position delete
 	ops     []string
 }
 
@@ -240,6 +241,7 @@ func (o *oracle) pickRows(composite bool) (rows []map[string]any, picked, existi
 // It returns every batch key, which base's equality path deletes whether or not it is live, and the rows to write.
 func (o *oracle) eqMerge(composite bool) (keys, rows []map[string]any, desc string) {
 	batch, picked, _ := o.pickRows(composite)
+	o.eqDead += len(picked)
 	keyCols := o.cols[:1]
 	if composite {
 		keyCols = o.cols[:2]
@@ -713,12 +715,15 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 		if err != nil {
 			return fail("%v", err)
 		}
-		// Known bug, skipped until fixed: once equality deletes exist, a filter delete also writes position deletes for
-		// rows they already removed, as its scan applies only position deletes (positionDeletesForFilter drops a task's
-		// EqualityDeleteFiles).
-		eqDels, _ := summaryInt(tbl, "total-equality-deletes")
-		if removed := (o.written - written) - (len(o.rows) - live); eqDels == 0 && dels-prevDels > removed {
-			return fail("total-position-deletes went %d -> %d, but the op removed %d rows", prevDels, dels, removed)
+		// Known bug: a filter delete also writes position deletes for rows that equality deletes already removed, as its
+		// scan applies only position deletes (positionDeletesForFilter drops a task's EqualityDeleteFiles). Each such row
+		// gets at most one, so the excess is charged to eqDead until this is fixed.
+		removed := (o.written - written) - (len(o.rows) - live)
+		if excess := dels - prevDels - removed; excess > 0 {
+			o.eqDead -= excess
+			if o.eqDead < 0 {
+				return fail("total-position-deletes went %d -> %d, but the op removed %d rows", prevDels, dels, removed)
+			}
 		}
 		prevDels = dels
 	}
