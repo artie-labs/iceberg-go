@@ -37,7 +37,7 @@ jobs:
     name: ${{ matrix.os }} go${{ matrix.go }}
     runs-on: ${{ matrix.os }}
     # Cache dirs are pinned to dot-prefixed paths under the workspace so they are
-    # identical across Linux/Windows/macOS (no per-OS path branching) and are
+    # identical across runners and are
     # excluded from `go`/golangci-lint `./...` expansion (leading-dot dirs are
     # ignored). Go and golangci-lint honor these env vars for their cache dirs.
     env:
@@ -60,10 +60,10 @@ jobs:
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: ${{ matrix.go }}
-        # Caching is managed explicitly below so saves can be gated to main and
+        # Caching is managed explicitly below so saves can be gated to artie/v0.7.0 and
         # the golangci-lint cache can be keyed by Go version.
         cache: false
-    # Restore is unconditional (PRs read main's caches); save is gated to main.
+    # Restore is unconditional (PRs read artie/v0.7.0's caches); save is gated to artie/v0.7.0.
     - name: Restore Go module and build cache
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:

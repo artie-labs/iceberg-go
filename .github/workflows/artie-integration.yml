@@ -35,7 +35,7 @@ permissions:
 jobs:
   integration-test:
     runs-on: ubuntu-latest
-    # Cache dirs pinned under the workspace; saves are gated to main below.
+    # Cache dirs pinned under the workspace; saves are gated to artie/v0.7.0 below.
     env:
       GOMODCACHE: ${{ github.workspace }}/.gocache/mod
       GOCACHE: ${{ github.workspace }}/.gocache/build
@@ -54,7 +54,7 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.25
-          # Caching managed explicitly below so saves can be gated to main.
+          # Caching managed explicitly below so saves can be gated to artie/v0.7.0.
           cache: false
 
       - name: Restore Go module and build cache
