@@ -21,6 +21,7 @@ package table_test
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -33,6 +34,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/iceberg-go"
@@ -42,9 +44,11 @@ import (
 )
 
 // The round-trip oracle runs a random, seeded sequence of appends (from Go and
-// from Spark), deletes and column adds against one merge-on-read table. It keeps the expected
-// rows in memory, checks a Go scan after every op and a Spark read at the end.
-// Opt-in: ORACLE_SEEDS=1,2,3 make integration-oracle. Replay a failure with its seed.
+// from Spark), deletes, merges (delete + append in one transaction) and column
+// adds against one merge-on-read table. It keeps the expected rows in memory,
+// checks a Go scan after every op and a Spark read at the end.
+// Opt-in: ORACLE_SEEDS=2,3,4 make integration-oracle. Replay a failure with its seed.
+// Seeds 1 and 13 fail until arrow-go's IsIn on bool arrays is fixed: a bool IN (true, false) misses rows.
 
 type oracleCol struct {
 	name string
@@ -59,11 +63,12 @@ var oracleTypes = []iceberg.PrimitiveType{
 var oracleStrings = []string{"", "a", "b", "it's", "ünï", strings.Repeat("x", 300)}
 
 type oracle struct {
-	rng    *rand.Rand
-	cols   []oracleCol // cols[0] is the required int64 "id"
-	rows   map[int64]map[string]any
-	nextID int64
-	ops    []string
+	rng     *rand.Rand
+	cols    []oracleCol // cols[0] is the required int64 "id"
+	rows    map[int64]map[string]any
+	nextID  int64
+	written int // rows ever written, old versions included
+	ops     []string
 }
 
 func (o *oracle) value(t iceberg.PrimitiveType) any {
@@ -88,6 +93,7 @@ func (o *oracle) value(t iceberg.PrimitiveType) any {
 
 func (o *oracle) newRows(n int) []map[string]any {
 	out := make([]map[string]any, n)
+	o.written += n
 	for i := range out {
 		o.nextID++
 		row := map[string]any{"id": o.nextID}
@@ -140,6 +146,133 @@ func (o *oracle) randomFilter() (iceberg.BooleanExpression, func(map[string]any)
 	default:
 		return iceberg.EqualTo(ref, v.(float64)), match, desc
 	}
+}
+
+// upsert picks existing and new keys like a merge batch in base/lib/iceberg/merge, and returns the new row versions
+// with the delete that removes the old ones. The filter is base's keyFilter (lookupFilter per column for a composite
+// key): each key column IN the batch's values and inside their min/max. A composite key is (id, c0); its filter also
+// names decoy rows, and a row matcher keeps only the batch's exact (id, c0) keys. The model is updated by key.
+func (o *oracle) upsert(composite bool) ([]map[string]any, iceberg.BooleanExpression, []table.DeleteOption, string) {
+	var existing []int64
+	for _, id := range slices.Sorted(maps.Keys(o.rows)) {
+		if !composite || o.rows[id]["c0"] != nil {
+			existing = append(existing, id)
+		}
+	}
+	o.rng.Shuffle(len(existing), func(i, j int) { existing[i], existing[j] = existing[j], existing[i] })
+	picked := existing[:min(len(existing), o.rng.Intn(6))]
+	o.written += len(picked)
+
+	var rows []map[string]any
+	for _, id := range picked {
+		row := map[string]any{"id": id}
+		for _, c := range o.cols[1:] {
+			row[c.name] = o.value(c.typ)
+		}
+		if composite {
+			row["c0"] = o.rows[id]["c0"]
+		}
+		rows = append(rows, row)
+		o.rows[id] = row
+	}
+	for _, row := range o.newRows(1 + o.rng.Intn(5)) {
+		for composite && row["c0"] == nil {
+			row["c0"] = o.value(o.cols[1].typ)
+		}
+		rows = append(rows, row)
+	}
+	desc := fmt.Sprintf("merge %d existing + %d new keys", len(picked), len(rows)-len(picked))
+
+	if !composite {
+		if len(picked) == 0 { // base skips the delete when no live row has a batch key
+			return rows, nil, nil, desc
+		}
+		filter := o.lookupFilter(o.cols[0], rows)
+		return rows, filter, nil, desc + " on id, filter " + filter.String()
+	}
+
+	keys := map[string]bool{}
+	for _, r := range rows {
+		keys[canon(r["id"])+"|"+canon(r["c0"])] = true
+	}
+	decoys := existing[len(picked):]
+	decoys = decoys[:min(len(decoys), 2)]
+	if len(picked)+len(decoys) == 0 {
+		return rows, nil, nil, desc
+	}
+	filterRows := slices.Clone(rows)
+	for _, id := range decoys {
+		filterRows = append(filterRows, o.rows[id])
+	}
+	filter := iceberg.NewAnd(o.lookupFilter(o.cols[0], filterRows), o.lookupFilter(o.cols[1], filterRows))
+	match := func(_ context.Context, batch arrow.RecordBatch) (*array.Boolean, error) {
+		b, err := batch.MarshalJSON()
+		if err != nil {
+			return nil, err
+		}
+		got, err := decodeRows(b)
+		if err != nil {
+			return nil, err
+		}
+		bldr := array.NewBooleanBuilder(memory.DefaultAllocator)
+		defer bldr.Release()
+		for _, r := range got {
+			bldr.Append(keys[canon(r["id"])+"|"+canon(r["c0"])])
+		}
+
+		return bldr.NewBooleanArray(), nil
+	}
+	opts := []table.DeleteOption{table.WithDeleteRowMatcher([]string{"id", "c0"}, match)}
+
+	return rows, filter, opts, desc + fmt.Sprintf(" on (id, c0), decoys %v, filter %s", decoys, filter)
+}
+
+// lookupFilter is c IN the rows' values, and for ordered types also inside their min/max, like base's lookupFilter.
+func (o *oracle) lookupFilter(c oracleCol, rows []map[string]any) iceberg.BooleanExpression {
+	var vals []any
+	for _, r := range rows {
+		vals = append(vals, r[c.name])
+	}
+	slices.SortFunc(vals, func(a, b any) int {
+		switch a := a.(type) {
+		case int32:
+			return cmp.Compare(a, b.(int32))
+		case int64:
+			return cmp.Compare(a, b.(int64))
+		case string:
+			return cmp.Compare(a, b.(string))
+		}
+		return 0
+	})
+	lits := make([]iceberg.Literal, len(vals))
+	for i, v := range vals {
+		switch v := v.(type) {
+		case string:
+			if c.typ == iceberg.PrimitiveTypes.Date {
+				d, _ := time.Parse(time.DateOnly, v)
+				lits[i] = iceberg.NewLiteral(iceberg.Date(d.Unix() / 86400))
+			} else {
+				lits[i] = iceberg.NewLiteral(v)
+			}
+		case int32:
+			lits[i] = iceberg.NewLiteral(v)
+		case int64:
+			lits[i] = iceberg.NewLiteral(v)
+		case bool:
+			lits[i] = iceberg.NewLiteral(v)
+		default:
+			lits[i] = iceberg.NewLiteral(v.(float64))
+		}
+	}
+	ref := iceberg.Reference(c.name)
+	in := iceberg.SetPredicate(iceberg.OpIn, ref, lits)
+	switch c.typ {
+	case iceberg.PrimitiveTypes.Bool, iceberg.PrimitiveTypes.Float64:
+		return in
+	}
+
+	return iceberg.NewAnd(in, iceberg.LiteralPredicate(iceberg.OpGTEQ, ref, lits[0]),
+		iceberg.LiteralPredicate(iceberg.OpLTEQ, ref, lits[len(lits)-1]))
 }
 
 func sqlLiteral(v any) string {
@@ -284,10 +417,27 @@ func (s *SparkIntegrationTestSuite) sparkRows(o *oracle, name string) ([]map[str
 	return nil, fmt.Errorf("no JSON row in spark output:\n%s", out)
 }
 
+// mergeDelete deletes like base's stageFilterDeletes: a v2 merge writes full file_path metrics on its position deletes
+// only for this delete.
+func mergeDelete(ctx context.Context, tx *table.Transaction, version string, filter iceberg.BooleanExpression, opts []table.DeleteOption) error {
+	if version != "2" {
+		return tx.Delete(ctx, filter, nil, opts...)
+	}
+	key := table.MetricsModeColumnConfPrefix + "." + iceberg.PositionalDeleteSchema.Field(0).Name
+	if err := tx.SetProperties(iceberg.Properties{key: "full"}); err != nil {
+		return err
+	}
+	if err := tx.Delete(ctx, filter, nil, opts...); err != nil {
+		return err
+	}
+
+	return tx.RemoveProperties([]string{key})
+}
+
 func (s *SparkIntegrationTestSuite) TestRoundTripOracle() {
 	seeds := os.Getenv("ORACLE_SEEDS")
 	if seeds == "" {
-		s.T().Skip("set ORACLE_SEEDS (e.g. 1,2,3) to run the round-trip oracle")
+		s.T().Skip("set ORACLE_SEEDS (e.g. 2,3,4) to run the round-trip oracle")
 	}
 	steps := 12
 	if v, err := strconv.Atoi(os.Getenv("ORACLE_STEPS")); err == nil {
@@ -321,24 +471,27 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 		o.cols = append(o.cols, c)
 		fields = append(fields, iceberg.NestedField{ID: i + 2, Name: c.name, Type: c.typ})
 	}
-	name := fmt.Sprintf("go_oracle_%d", seed)
+	name := fmt.Sprintf("go_oracle_%d_%d", seed, os.Getpid()) // the Docker stack is shared between runs
 	ident := catalog.ToIdentifier("default", name)
 	_ = s.cat.DropTable(s.ctx, ident)
+	version := strconv.Itoa(2 + o.rng.Intn(2)) // v3 merges write deletion vectors
 	tbl, err := s.cat.CreateTable(s.ctx, ident, iceberg.NewSchema(0, fields...),
 		catalog.WithProperties(iceberg.Properties{
-			table.PropertyFormatVersion:   "2",
+			table.PropertyFormatVersion:   version,
 			table.WriteDeleteModeKey:      table.WriteModeMergeOnRead, // what transfer uses
 			table.ParquetRowGroupLimitKey: "5",
 		}))
 	if err != nil {
 		return fail("create: %v", err)
 	}
-	o.ops = append(o.ops, fmt.Sprintf("create merge-on-read cols=%v", o.cols))
+	o.ops = append(o.ops, fmt.Sprintf("create %s v%s merge-on-read cols=%v", name, version, o.cols))
 
+	prevDels := 0
 	for step := range steps {
+		written, live := o.written, len(o.rows)
 		op := o.rng.Intn(100)
 		switch {
-		case step == 0 || op < 35:
+		case step == 0 || op < 30 || (version == "3" && op < 45): // Spark 1.8 in the stack cannot write v3 (first-row-id is null)
 			rows := o.newRows(1 + o.rng.Intn(20))
 			o.ops = append(o.ops, fmt.Sprintf("go append %d rows", len(rows)))
 			arrSchema, err := table.SchemaToArrowSchema(tbl.Schema(), nil, true, false)
@@ -355,7 +508,7 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 			if err != nil {
 				return fail("go append: %v", err)
 			}
-		case op < 50:
+		case op < 45:
 			rows := o.newRows(1 + o.rng.Intn(10))
 			o.ops = append(o.ops, fmt.Sprintf("spark append %d rows", len(rows)))
 			names := make([]string, len(o.cols))
@@ -377,13 +530,41 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 			if tbl, err = s.cat.LoadTable(s.ctx, ident); err != nil {
 				return fail("reload: %v", err)
 			}
-		case op < 85:
+		case op < 65:
 			filter, match, desc := o.randomFilter()
 			o.ops = append(o.ops, "go delete where "+desc)
 			if tbl, err = tbl.Delete(s.ctx, filter, nil); err != nil {
 				return fail("go delete: %v", err)
 			}
 			maps.DeleteFunc(o.rows, func(_ int64, r map[string]any) bool { return match(r) })
+		case op < 85:
+			rows, filter, opts, desc := o.upsert(o.rng.Intn(2) == 0)
+			o.ops = append(o.ops, "go "+desc)
+			arrSchema, err := table.SchemaToArrowSchema(tbl.Schema(), nil, true, false)
+			if err != nil {
+				return fail("arrow schema: %v", err)
+			}
+			b, _ := json.Marshal(rows)
+			arrTbl, err := array.TableFromJSON(memory.DefaultAllocator, arrSchema, []string{string(b)})
+			if err != nil {
+				return fail("build arrow: %v", err)
+			}
+			rdr := array.NewTableReader(arrTbl, -1)
+			tx := tbl.NewTransaction()
+			if filter != nil {
+				err = mergeDelete(s.ctx, tx, version, filter, opts)
+			}
+			if err == nil {
+				err = tx.Append(s.ctx, rdr, nil)
+			}
+			if err == nil {
+				tbl, err = tx.Commit(s.ctx)
+			}
+			rdr.Release()
+			arrTbl.Release()
+			if err != nil {
+				return fail("go merge: %v", err)
+			}
 		default:
 			c := oracleCol{fmt.Sprintf("c%d", len(o.cols)-1), oracleTypes[o.rng.Intn(len(oracleTypes))]}
 			o.ops = append(o.ops, fmt.Sprintf("add column %s %s", c.name, c.typ))
@@ -404,6 +585,17 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 		if d := o.diff(got); d != "" {
 			return fail("go scan differs from model:\n%s", d)
 		}
+		// A repeated position delete leaves reads unchanged but inflates the total that production derives row counts
+		// from. Dropping a file can lower the total, so this is a bound: an op adds at most one delete per row it removed.
+		raw, ok := tbl.CurrentSnapshot().Summary.Properties["total-position-deletes"]
+		dels, err := strconv.Atoi(raw)
+		if !ok || err != nil {
+			return fail("total-position-deletes is %q (present=%v)", raw, ok)
+		}
+		if removed := (o.written - written) - (len(o.rows) - live); dels-prevDels > removed {
+			return fail("total-position-deletes went %d -> %d, but the op removed %d rows", prevDels, dels, removed)
+		}
+		prevDels = dels
 	}
 
 	got, err := s.sparkRows(o, name)
@@ -413,6 +605,7 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 	if d := o.diff(got); d != "" {
 		return fail("spark read differs from model:\n%s", d)
 	}
+	_ = s.cat.DropTable(s.ctx, ident)
 
 	return ""
 }
