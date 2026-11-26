@@ -1144,10 +1144,14 @@ func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs
 	// again, so each task carries its file's position delete files from scan
 	// planning, which matches them by sequence number, partition and path. The
 	// scan is pinned to the snapshot files came from, so a branch transaction
-	// doesn't apply main's deletes.
+	// doesn't apply main's deletes. It keeps the current schema, since the
+	// filter may use a column added after that snapshot.
 	scanOpts := []ScanOption{WithRowFilter(filter), WithCaseSensitive(caseSensitive)}
 	if snap := t.planningSnapshot(meta); snap != nil {
-		scanOpts = append(scanOpts, WithSnapshotID(snap.SnapshotID))
+		scanOpts = append(scanOpts, WithSnapshotID(snap.SnapshotID), func(scan *Scan) {
+			useSnapshotSchema := false
+			scan.useSnapshotSchema = &useSnapshotSchema
+		})
 	}
 	scan, err := t.Scan(scanOpts...)
 	if err != nil {

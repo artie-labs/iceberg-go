@@ -371,3 +371,33 @@ func TestMergeOnReadDeleteSkipsRowsAlreadyDeleted(t *testing.T) {
 		assert.Equal(t, []int64{3, 4}, ids, "main's delete of id=1 doesn't count on the branch")
 	})
 }
+
+func TestMergeOnReadDeleteOnColumnAddedLater(t *testing.T) {
+	ctx := context.Background()
+	tbl := newMergeOnReadTestTable(t)
+
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "data", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	data, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{
+		`[{"id":1,"data":"a"},{"id":2,"data":"b"},{"id":3,"data":"c"}]`,
+	})
+	require.NoError(t, err)
+	defer data.Release()
+	tbl, err = tbl.Append(ctx, array.NewTableReader(data, -1), nil)
+	require.NoError(t, err)
+
+	txn := tbl.NewTransaction()
+	require.NoError(t, txn.UpdateSchema(true, false).AddColumn([]string{"extra"}, iceberg.PrimitiveTypes.String, "", false, nil).Commit())
+	tbl, err = txn.Commit(ctx)
+	require.NoError(t, err)
+
+	tbl, err = tbl.Delete(ctx, iceberg.NotNull(iceberg.Reference("extra")), nil)
+	require.NoError(t, err)
+	assert.Equal(t, []int64{1, 2, 3}, idsInTable(t, tbl), "no row has extra set")
+
+	tbl, err = tbl.Delete(ctx, iceberg.IsNull(iceberg.Reference("extra")), nil)
+	require.NoError(t, err)
+	assert.Empty(t, idsInTable(t, tbl))
+}
