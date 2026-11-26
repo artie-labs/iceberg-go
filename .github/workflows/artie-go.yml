@@ -33,25 +33,15 @@ permissions:
   contents: read
 
 jobs:
-  lint-and-test:
-    name: ${{ matrix.os }} go${{ matrix.go }}
-    runs-on: ${{ matrix.os }}
-    # Cache dirs are pinned to dot-prefixed paths under the workspace so they are
-    # identical across runners and are
-    # excluded from `go`/golangci-lint `./...` expansion (leading-dot dirs are
-    # ignored). Go and golangci-lint honor these env vars for their cache dirs.
+  # Lint once: the result does not depend on the Go version, and running it
+  # beside the tests takes it off the critical path.
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
     env:
       GOMODCACHE: ${{ github.workspace }}/.gocache/mod
       GOCACHE: ${{ github.workspace }}/.gocache/build
       GOLANGCI_LINT_CACHE: ${{ github.workspace }}/.gocache/golangci
-    strategy:
-      max-parallel: 15
-      fail-fast: false
-      matrix:
-        go: [ '1.25.9', '1.26.1' ]
-        os:
-          - 'ubuntu-latest'
-
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
@@ -59,9 +49,7 @@ jobs:
     - name: Install Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
-        go-version: ${{ matrix.go }}
-        # Caching is managed explicitly below so saves can be gated to artie/v0.7.0 and
-        # the golangci-lint cache can be keyed by Go version.
+        go-version: '1.26.1'
         cache: false
     # Restore is unconditional (PRs read artie/v0.7.0's caches); save is gated to artie/v0.7.0.
     - name: Restore Go module and build cache
@@ -70,28 +58,61 @@ jobs:
         path: |
           ${{ github.workspace }}/.gocache/mod
           ${{ github.workspace }}/.gocache/build
-        key: go-${{ matrix.os }}-go${{ matrix.go }}-${{ hashFiles('go.sum') }}
+        key: go-ubuntu-latest-go1.26.1-${{ hashFiles('go.sum') }}
         restore-keys: |
-          go-${{ matrix.os }}-go${{ matrix.go }}-
+          go-ubuntu-latest-go1.26.1-
     - name: Restore golangci-lint cache
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ github.workspace }}/.gocache/golangci
-        key: golangci-${{ matrix.os }}-go${{ matrix.go }}-${{ hashFiles('go.sum', '.golangci.yml') }}
+        key: golangci-ubuntu-latest-go1.26.1-${{ hashFiles('go.sum', '.golangci.yml') }}
         restore-keys: |
-          golangci-${{ matrix.os }}-go${{ matrix.go }}-
+          golangci-ubuntu-latest-go1.26.1-
     - name: Run golangci-lint
       uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
       with:
         version: v2.12.2
         args: --timeout=10m
-        # The action's own cache key omits the Go version, so all matrix cells
-        # collide on one entry; we manage the cache explicitly above instead.
         skip-cache: true
-    - name: Run tests with race detector 
+    - name: Save golangci-lint cache
+      if: github.ref == 'refs/heads/artie/v0.7.0'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ github.workspace }}/.gocache/golangci
+        key: golangci-ubuntu-latest-go1.26.1-${{ hashFiles('go.sum', '.golangci.yml') }}
+
+  test:
+    name: test go${{ matrix.go }}
+    runs-on: ubuntu-latest
+    env:
+      GOMODCACHE: ${{ github.workspace }}/.gocache/mod
+      GOCACHE: ${{ github.workspace }}/.gocache/build
+    strategy:
+      fail-fast: false
+      matrix:
+        go: [ '1.25.9', '1.26.1' ]
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Install Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: ${{ matrix.go }}
+        cache: false
+    - name: Restore Go module and build cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ github.workspace }}/.gocache/mod
+          ${{ github.workspace }}/.gocache/build
+        key: go-ubuntu-latest-go${{ matrix.go }}-${{ hashFiles('go.sum') }}
+        restore-keys: |
+          go-ubuntu-latest-go${{ matrix.go }}-
+    - name: Run tests with race detector
       run: make test-race
     - name: Run Arrow ownership assertions
-      if: matrix.os == 'ubuntu-latest' && matrix.go == '1.26.1'
+      if: matrix.go == '1.26.1'
       run: make test-assert
     - name: Save Go module and build cache
       if: github.ref == 'refs/heads/artie/v0.7.0'
@@ -100,10 +121,4 @@ jobs:
         path: |
           ${{ github.workspace }}/.gocache/mod
           ${{ github.workspace }}/.gocache/build
-        key: go-${{ matrix.os }}-go${{ matrix.go }}-${{ hashFiles('go.sum') }}
-    - name: Save golangci-lint cache
-      if: github.ref == 'refs/heads/artie/v0.7.0'
-      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: ${{ github.workspace }}/.gocache/golangci
-        key: golangci-${{ matrix.os }}-go${{ matrix.go }}-${{ hashFiles('go.sum', '.golangci.yml') }}
+        key: go-ubuntu-latest-go${{ matrix.go }}-${{ hashFiles('go.sum') }}
