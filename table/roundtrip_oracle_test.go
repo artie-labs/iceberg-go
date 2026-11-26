@@ -34,6 +34,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/iceberg-go"
@@ -43,7 +44,7 @@ import (
 )
 
 // The round-trip oracle runs a random, seeded sequence of appends (from Go and
-// from Spark), deletes and column adds against one merge-on-read table. It keeps the expected
+// from Spark), deletes, merges (delete + append in one transaction) and column adds against one merge-on-read table. It keeps the expected
 // rows in memory, checks a Go scan after every op and a Spark read at the end.
 // Opt-in: ORACLE_SEEDS=1,2,3 make integration-oracle. Replay a failure with its seed.
 
@@ -141,6 +142,75 @@ func (o *oracle) randomFilter() (iceberg.BooleanExpression, func(map[string]any)
 	default:
 		return iceberg.EqualTo(ref, v.(float64)), match, desc
 	}
+}
+
+// upsert picks existing and new keys like a merge batch in base/lib/iceberg/merge, and returns the new row versions
+// with the delete that removes the old ones. A composite key is (id, c0): the filter is a superset on id that also
+// names decoy ids, and a row matcher keeps only the exact (id, c0) keys. The model is updated by key.
+func (o *oracle) upsert(composite bool) ([]map[string]any, iceberg.BooleanExpression, []table.DeleteOption, string) {
+	var existing []int64
+	for _, id := range slices.Sorted(maps.Keys(o.rows)) {
+		if !composite || o.rows[id]["c0"] != nil {
+			existing = append(existing, id)
+		}
+	}
+	o.rng.Shuffle(len(existing), func(i, j int) { existing[i], existing[j] = existing[j], existing[i] })
+	picked := existing[:min(len(existing), o.rng.Intn(6))]
+
+	var rows []map[string]any
+	for _, id := range picked {
+		row := map[string]any{"id": id}
+		for _, c := range o.cols[1:] {
+			row[c.name] = o.value(c.typ)
+		}
+		if composite {
+			row["c0"] = o.rows[id]["c0"]
+		}
+		rows = append(rows, row)
+		o.rows[id] = row
+	}
+	for _, row := range o.newRows(1 + o.rng.Intn(5)) {
+		for composite && row["c0"] == nil {
+			row["c0"] = o.value(o.cols[1].typ)
+		}
+		rows = append(rows, row)
+	}
+	desc := fmt.Sprintf("merge %d existing + %d new keys", len(picked), len(rows)-len(picked))
+	if len(picked) == 0 {
+		return rows, nil, nil, desc
+	}
+
+	ids := slices.Clone(picked)
+	if !composite {
+		return rows, iceberg.IsIn(iceberg.Reference("id"), ids...), nil, desc + fmt.Sprintf(" on id %v", ids)
+	}
+
+	keys := map[string]bool{}
+	for _, r := range rows {
+		keys[canon(r["id"])+"|"+canon(r["c0"])] = true
+	}
+	decoys := existing[len(picked):]
+	ids = append(ids, decoys[:min(len(decoys), 2)]...)
+	match := func(_ context.Context, batch arrow.RecordBatch) (*array.Boolean, error) {
+		b, err := batch.MarshalJSON()
+		if err != nil {
+			return nil, err
+		}
+		got, err := decodeRows(b)
+		if err != nil {
+			return nil, err
+		}
+		bldr := array.NewBooleanBuilder(memory.DefaultAllocator)
+		defer bldr.Release()
+		for _, r := range got {
+			bldr.Append(keys[canon(r["id"])+"|"+canon(r["c0"])])
+		}
+
+		return bldr.NewBooleanArray(), nil
+	}
+	opts := []table.DeleteOption{table.WithDeleteRowMatcher([]string{"id", "c0"}, match)}
+
+	return rows, iceberg.IsIn(iceberg.Reference("id"), ids...), opts, desc + fmt.Sprintf(" on (id, c0), filter id %v", ids)
 }
 
 func sqlLiteral(v any) string {
@@ -332,21 +402,22 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 	name := fmt.Sprintf("go_oracle_%d", seed)
 	ident := catalog.ToIdentifier("default", name)
 	_ = s.cat.DropTable(s.ctx, ident)
+	version := strconv.Itoa(2 + o.rng.Intn(2)) // v3 merges write deletion vectors
 	tbl, err := s.cat.CreateTable(s.ctx, ident, iceberg.NewSchema(0, fields...),
 		catalog.WithProperties(iceberg.Properties{
-			table.PropertyFormatVersion:   "2",
+			table.PropertyFormatVersion:   version,
 			table.WriteDeleteModeKey:      table.WriteModeMergeOnRead, // what transfer uses
 			table.ParquetRowGroupLimitKey: "5",
 		}))
 	if err != nil {
 		return fail("create: %v", err)
 	}
-	o.ops = append(o.ops, fmt.Sprintf("create merge-on-read cols=%v", o.cols))
+	o.ops = append(o.ops, fmt.Sprintf("create v%s merge-on-read cols=%v", version, o.cols))
 
 	for step := range steps {
 		op := o.rng.Intn(100)
 		switch {
-		case step == 0 || op < 35:
+		case step == 0 || op < 30:
 			rows := o.newRows(1 + o.rng.Intn(20))
 			o.ops = append(o.ops, fmt.Sprintf("go append %d rows", len(rows)))
 			arrSchema, err := table.SchemaToArrowSchema(tbl.Schema(), nil, true, false)
@@ -363,7 +434,7 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 			if err != nil {
 				return fail("go append: %v", err)
 			}
-		case op < 50:
+		case op < 45:
 			rows := o.newRows(1 + o.rng.Intn(10))
 			o.ops = append(o.ops, fmt.Sprintf("spark append %d rows", len(rows)))
 			names := make([]string, len(o.cols))
@@ -385,13 +456,41 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 			if tbl, err = s.cat.LoadTable(s.ctx, ident); err != nil {
 				return fail("reload: %v", err)
 			}
-		case op < 85:
+		case op < 65:
 			filter, match, desc := o.randomFilter()
 			o.ops = append(o.ops, "go delete where "+desc)
 			if tbl, err = tbl.Delete(s.ctx, filter, nil); err != nil {
 				return fail("go delete: %v", err)
 			}
 			maps.DeleteFunc(o.rows, func(_ int64, r map[string]any) bool { return match(r) })
+		case op < 85:
+			rows, filter, opts, desc := o.upsert(o.rng.Intn(2) == 0)
+			o.ops = append(o.ops, "go "+desc)
+			arrSchema, err := table.SchemaToArrowSchema(tbl.Schema(), nil, true, false)
+			if err != nil {
+				return fail("arrow schema: %v", err)
+			}
+			b, _ := json.Marshal(rows)
+			arrTbl, err := array.TableFromJSON(memory.DefaultAllocator, arrSchema, []string{string(b)})
+			if err != nil {
+				return fail("build arrow: %v", err)
+			}
+			rdr := array.NewTableReader(arrTbl, -1)
+			tx := tbl.NewTransaction()
+			if filter != nil {
+				err = tx.Delete(s.ctx, filter, nil, opts...)
+			}
+			if err == nil {
+				err = tx.Append(s.ctx, rdr, nil)
+			}
+			if err == nil {
+				tbl, err = tx.Commit(s.ctx)
+			}
+			rdr.Release()
+			arrTbl.Release()
+			if err != nil {
+				return fail("go merge: %v", err)
+			}
 		default:
 			c := oracleCol{fmt.Sprintf("c%d", len(o.cols)-1), oracleTypes[o.rng.Intn(len(oracleTypes))]}
 			o.ops = append(o.ops, fmt.Sprintf("add column %s %s", c.name, c.typ))
