@@ -503,7 +503,9 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 	}
 	o.ops = append(o.ops, fmt.Sprintf("create %s v%s merge-on-read cols=%v", name, version, o.cols))
 
+	prevDels := 0
 	for step := range steps {
+		written, live := o.written, len(o.rows)
 		op := o.rng.Intn(100)
 		switch {
 		case step == 0 || op < 30 || (version == "3" && op < 45): // Spark 1.8 in the stack cannot write v3 (first-row-id is null)
@@ -601,15 +603,16 @@ func (s *SparkIntegrationTestSuite) runOracle(seed int64, steps int) string {
 			return fail("go scan differs from model:\n%s", d)
 		}
 		// A repeated position delete leaves reads unchanged but inflates the total that production derives row counts
-		// from. Deletes of a dropped file may still count, so this is a bound: each written row is deleted at most once.
+		// from. Dropping a file can lower the total, so this is a bound: an op adds at most one delete per row it removed.
 		raw, ok := tbl.CurrentSnapshot().Summary.Properties["total-position-deletes"]
 		dels, err := strconv.Atoi(raw)
 		if !ok || err != nil {
 			return fail("total-position-deletes is %q (present=%v)", raw, ok)
 		}
-		if dels > o.written-len(o.rows) {
-			return fail("total-position-deletes %d > %d rows written - %d live", dels, o.written, len(o.rows))
+		if removed := (o.written - written) - (len(o.rows) - live); dels-prevDels > removed {
+			return fail("total-position-deletes went %d -> %d, but the op removed %d rows", prevDels, dels, removed)
 		}
+		prevDels = dels
 	}
 
 	got, err := s.sparkRows(o, name)
