@@ -2249,10 +2249,11 @@ type recordWritingArgs struct {
 	// channel capacity; non-positive uses the default (see
 	// rollingDataWriterQueueCapacity).
 	recordBatchBufferSize int
-	// existingDVs maps a data file path to the positions already recorded in
-	// its current deletion vector. On the v3 DV write path these are folded
-	// into the newly written DV so a data file that already had a DV ends up
-	// with a single merged vector (the caller removes the superseded one).
+	// existingDVs maps a data file path to the positions already deleted from
+	// it: its current deletion vector or its folded v2 position deletes. On
+	// the v3 DV write path a file's seed is folded into its new DV only once
+	// the file gets a position not already in the seed, so a file with nothing
+	// new gets no DV and the caller keeps its existing deletes.
 	existingDVs map[string]*dv.RoaringPositionBitmap
 }
 
@@ -2541,29 +2542,15 @@ func positionDeleteRecordsToDataFilesDV(ctx context.Context, rootLocation string
 			return metadata.PartitionSpecByID(int(id))
 		})
 
-		// Seed the writer with any deletion vector the referenced data file
-		// already carries so its previously deleted positions survive into the
-		// merged DV. The scan that produced args.itr does NOT apply the existing
-		// DVs (makePositionDeleteRecordsForFilter builds its FileScanTasks
-		// without DeleteFiles), so the incoming batches may re-report positions
-		// already in the old DV; re-Setting them on top of the seed is a no-op
-		// because the bitmap is idempotent. The seed is what guarantees the old
-		// positions survive — do not remove it, or a second delete would drop
-		// the earlier deletes and resurrect those rows. The spec allows at most
-		// one DV per data file, so the caller supersedes the old DV once this
-		// merged one is written.
+		// args.existingDVs holds, per data file, every position already deleted:
+		// its current DV and any v2 position deletes folded in after an upgrade.
+		// The scan that produced args.itr may re-report those positions. A
+		// file's seed is loaded on its first position not already in it, so
+		// the merged DV keeps the earlier deletes, and a file with nothing new
+		// gets no DV: the caller then keeps its existing deletes. The spec
+		// allows at most one DV per data file.
 		hasEntries := false
-		for filePath, bitmap := range args.existingDVs {
-			pCtx, ok := partitionContextByFilePath[filePath]
-			if !ok {
-				yield(nil, fmt.Errorf("unexpected missing partition context for existing deletion vector path %s", filePath))
-
-				return
-			}
-			writer.Load(filePath, bitmap, pCtx.specID, pCtx.partitionData)
-			hasEntries = true
-		}
-
+		loaded := make(map[string]struct{}, len(args.existingDVs))
 		for batch, err := range args.itr {
 			if err != nil {
 				yield(nil, err)
@@ -2582,7 +2569,17 @@ func positionDeleteRecordsToDataFilesDV(ctx context.Context, rootLocation string
 
 					return
 				}
-				if err := writer.AddPosition(filePath, positions.Value(int(i)), pCtx.specID, pCtx.partitionData); err != nil {
+				position := positions.Value(int(i))
+				if seed, ok := args.existingDVs[filePath]; ok {
+					if position >= 0 && seed.Contains(uint64(position)) {
+						continue
+					}
+					if _, ok := loaded[filePath]; !ok {
+						writer.Load(filePath, seed, pCtx.specID, pCtx.partitionData)
+						loaded[filePath] = struct{}{}
+					}
+				}
+				if err := writer.AddPosition(filePath, position, pCtx.specID, pCtx.partitionData); err != nil {
 					yield(nil, err)
 
 					return

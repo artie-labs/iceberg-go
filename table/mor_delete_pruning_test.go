@@ -19,8 +19,10 @@ package table_test
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -400,4 +402,171 @@ func TestMergeOnReadDeleteOnColumnAddedLater(t *testing.T) {
 	tbl, err = tbl.Delete(ctx, iceberg.IsNull(iceberg.Reference("extra")), nil)
 	require.NoError(t, err)
 	assert.Empty(t, idsInTable(t, tbl))
+}
+
+func newMergeOnReadTestTableProps(t *testing.T, props iceberg.Properties) *table.Table {
+	t.Helper()
+
+	location := filepath.ToSlash(t.TempDir())
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "data", Type: iceberg.PrimitiveTypes.String, Required: false},
+	)
+	props[table.WriteDeleteModeKey] = table.WriteModeMergeOnRead
+	meta, err := table.NewMetadata(schema, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, location, props)
+	require.NoError(t, err)
+
+	metaLoc := location + "/metadata/v1.metadata.json"
+	fsF := func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }
+	cat := &concurrentTestCatalog{metadata: meta, location: metaLoc, fsF: fsF}
+
+	return table.New(table.Identifier{"db", "mor_delete_test"}, meta, metaLoc, fsF, cat)
+}
+
+// TestMergeOnReadDeleteV3StatsCountEachDeletedRowOnce guards the snapshot totals of v3 merge-on-read deletes. A
+// deletion vector that absorbs a file's legacy Parquet position deletes replaces them, so they stop counting, and a
+// delete that removes no new row writes no new vector.
+func TestMergeOnReadDeleteV3StatsCountEachDeletedRowOnce(t *testing.T) {
+	ctx := context.Background()
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "data", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	appendRows := func(tbl *table.Table) *table.Table {
+		data, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{
+			`[{"id":1,"data":"a"},{"id":2,"data":"b"},{"id":3,"data":"c"},{"id":4,"data":"d"},{"id":5,"data":"e"}]`,
+		})
+		require.NoError(t, err)
+		defer data.Release()
+		tbl, err = tbl.Append(ctx, array.NewTableReader(data, -1), nil)
+		require.NoError(t, err)
+
+		return tbl
+	}
+	// upgraded returns a table that deleted ids 1 and 2 as v2 and was then upgraded to v3. With fileScoped, the legacy
+	// position delete file records full file_path bounds (as artie-labs/base's merge sets).
+	upgraded := func(fileScoped bool) *table.Table {
+		props := iceberg.Properties{table.PropertyFormatVersion: "2"}
+		if fileScoped {
+			props[table.MetricsModeColumnConfPrefix+".file_path"] = "full"
+		}
+		tbl := appendRows(newMergeOnReadTestTableProps(t, props))
+		tbl, err := tbl.Delete(ctx, iceberg.LessThanEqual(iceberg.Reference("id"), int64(2)), nil)
+		require.NoError(t, err)
+		txn := tbl.NewTransaction()
+		require.NoError(t, txn.UpgradeFormatVersion(3))
+		tbl, err = txn.Commit(ctx)
+		require.NoError(t, err)
+
+		return tbl
+	}
+	totals := func(tbl *table.Table) (string, string) {
+		summary := tbl.CurrentSnapshot().Summary.Properties
+
+		return summary["total-position-deletes"], summary["total-delete-files"]
+	}
+
+	t.Run("absorbs a file-scoped legacy delete", func(t *testing.T) {
+		// The new vector holds ids 1-3 and replaces the legacy file of ids 1 and 2.
+		tbl, err := upgraded(true).Delete(ctx, iceberg.LessThanEqual(iceberg.Reference("id"), int64(3)), nil)
+		require.NoError(t, err)
+		assert.Equal(t, []int64{4, 5}, idsInTable(t, tbl))
+		deletes, files := totals(tbl)
+		assert.Equal(t, "3", deletes)
+		assert.Equal(t, "1", files)
+	})
+	t.Run("keeps a legacy delete with nothing new", func(t *testing.T) {
+		// Rows the legacy file already deleted: nothing new to write.
+		tbl, err := upgraded(true).Delete(ctx, iceberg.LessThanEqual(iceberg.Reference("id"), int64(2)), nil)
+		require.NoError(t, err)
+		assert.Equal(t, []int64{3, 4, 5}, idsInTable(t, tbl))
+		deletes, files := totals(tbl)
+		assert.Equal(t, "2", deletes)
+		assert.Equal(t, "1", files)
+	})
+	t.Run("keeps an unchanged vector", func(t *testing.T) {
+		// Rows a deletion vector already deleted: the vector stays as it is.
+		tbl := appendRows(newMergeOnReadTestTableVersion(t, "3"))
+		tbl, err := tbl.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), int64(2)), nil)
+		require.NoError(t, err)
+		tbl, err = tbl.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), int64(2)), nil)
+		require.NoError(t, err)
+		assert.Equal(t, []int64{1, 3, 4, 5}, idsInTable(t, tbl))
+		deletes, files := totals(tbl)
+		assert.Equal(t, "1", deletes)
+		assert.Equal(t, "1", files)
+		summary := tbl.CurrentSnapshot().Summary.Properties
+		assert.Empty(t, summary["added-delete-files"], "an unchanged vector must not be rewritten")
+		assert.Empty(t, summary["removed-delete-files"], "an unchanged vector must not be superseded")
+	})
+}
+
+// TestMergeOnReadDeleteV3ReplacesOnlyChangedFilesDeletes covers one v3 delete across two data files: file A gets a new
+// deleted row and file B only re-matches a row it already deleted. A's earlier deletes are replaced by its new vector;
+// B's stay as they are.
+func TestMergeOnReadDeleteV3ReplacesOnlyChangedFilesDeletes(t *testing.T) {
+	ctx := context.Background()
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "data", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	// appendFile appends ids from..from+4 as one data file.
+	appendFile := func(tbl *table.Table, from int64) *table.Table {
+		rows := make([]string, 0, 5)
+		for id := from; id < from+5; id++ {
+			rows = append(rows, fmt.Sprintf(`{"id":%d,"data":"x"}`, id))
+		}
+		data, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{"[" + strings.Join(rows, ",") + "]"})
+		require.NoError(t, err)
+		defer data.Release()
+		tbl, err = tbl.Append(ctx, array.NewTableReader(data, -1), nil)
+		require.NoError(t, err)
+
+		return tbl
+	}
+	// twoFiles returns a table with file A (ids 1-5) and file B (ids 6-10), and ids 2 and 7 deleted one at a time.
+	twoFiles := func(props iceberg.Properties) *table.Table {
+		tbl := appendFile(appendFile(newMergeOnReadTestTableProps(t, props), 1), 6)
+		for _, id := range []int64{2, 7} {
+			var err error
+			tbl, err = tbl.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), id), nil)
+			require.NoError(t, err)
+		}
+
+		return tbl
+	}
+	// Re-matches 2 and 7, and newly deletes 3 in file A.
+	filter := iceberg.IsIn(iceberg.Reference("id"), int64(2), int64(3), int64(7))
+
+	t.Run("deletion vectors", func(t *testing.T) {
+		// Deletion vectors: A's is rewritten as {2, 3}, B's {7} stays.
+		tbl, err := twoFiles(iceberg.Properties{table.PropertyFormatVersion: "3"}).Delete(ctx, filter, nil)
+		require.NoError(t, err)
+		assert.Equal(t, []int64{1, 4, 5, 6, 8, 9, 10}, idsInTable(t, tbl))
+		summary := tbl.CurrentSnapshot().Summary.Properties
+		assert.Equal(t, "1", summary["added-delete-files"])
+		assert.Equal(t, "1", summary["removed-delete-files"])
+		assert.Equal(t, "3", summary["total-position-deletes"])
+		assert.Equal(t, "2", summary["total-delete-files"])
+	})
+	t.Run("legacy deletes after upgrade", func(t *testing.T) {
+		// File-scoped legacy Parquet deletes after a v2 to v3 upgrade: A's is absorbed and removed, B's stays.
+		tbl := twoFiles(iceberg.Properties{
+			table.PropertyFormatVersion:                      "2",
+			table.MetricsModeColumnConfPrefix + ".file_path": "full",
+		})
+		txn := tbl.NewTransaction()
+		require.NoError(t, txn.UpgradeFormatVersion(3))
+		tbl, err := txn.Commit(ctx)
+		require.NoError(t, err)
+
+		tbl, err = tbl.Delete(ctx, filter, nil)
+		require.NoError(t, err)
+		assert.Equal(t, []int64{1, 4, 5, 6, 8, 9, 10}, idsInTable(t, tbl))
+		summary := tbl.CurrentSnapshot().Summary.Properties
+		assert.Equal(t, "1", summary["added-delete-files"])
+		assert.Equal(t, "1", summary["removed-delete-files"])
+		assert.Equal(t, "3", summary["total-position-deletes"])
+		assert.Equal(t, "2", summary["total-delete-files"])
+	})
 }

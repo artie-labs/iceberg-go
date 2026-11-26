@@ -1024,12 +1024,14 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 
 	var referenced []string
 	seen := make(map[string]struct{})
+	rewritten := make(map[string]struct{})
 	for f, err := range posDeleteFiles {
 		if err != nil {
 			return nil, err
 		}
 		updater.appendDeleteFile(f)
 		if ref := iceberginternal.BorrowedDataFileReferencedDataFile(f); ref != nil && *ref != "" {
+			rewritten[*ref] = struct{}{}
 			if _, ok := seen[*ref]; !ok {
 				seen[*ref] = struct{}{}
 				referenced = append(referenced, *ref)
@@ -1044,12 +1046,17 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 	}
 
 	// Supersede the old DVs only after the merged replacements are staged, so a
-	// write failure above leaves the existing DVs untouched.
-	for _, dvFile := range existingDVs {
-		updater.removeDeletionVector(dvFile)
+	// write failure above leaves the existing DVs untouched. A file that got no
+	// new DV deleted nothing new and keeps its existing deletes.
+	for path, dvFile := range existingDVs {
+		if _, ok := rewritten[path]; ok {
+			updater.removeDeletionVector(dvFile)
+		}
 	}
 	for _, f := range folded.drop {
-		updater.removeDeleteFile(f)
+		if _, ok := rewritten[referencedDataFilePath(f)]; ok {
+			updater.removeDeleteFile(f)
+		}
 	}
 
 	return referenced, nil
@@ -1067,7 +1074,7 @@ type foldedPositionDeletes struct {
 //
 // Like Java's BaseDVFileWriter, only file-scoped delete files (one target data file) are dropped. A
 // partition-scoped file can cover other data files, so it stays: readers ignore it for files with a vector
-// and still apply it to the rest. Dropping is safe because every seeded file gets a vector written.
+// and still apply it to the rest. The caller drops a file only once its data file gets a new vector.
 func foldPositionDeletes(ctx context.Context, fs io.IO, partial []iceberg.ManifestEntry, positional []iceberg.ManifestEntry, dvs liveDeletionVectors) (foldedPositionDeletes, error) {
 	var folded foldedPositionDeletes
 	if len(partial) == 0 || len(positional) == 0 {

@@ -219,6 +219,6 @@ func TestV3MergeOnReadUpgradeSeedOnlyDeletionVector(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, []int64{2, 3, 4, 5}, idsInTable(t, tbl))
-	assert.Equal(t, 1, liveDVCount(t, tbl), "the seeded DV must be written even with no new positions")
-	assert.Zero(t, livePositionDeleteFiles(t, tbl))
+	assert.Zero(t, liveDVCount(t, tbl), "a delete with no new positions keeps the legacy deletes")
+	assert.Equal(t, 1, livePositionDeleteFiles(t, tbl))
 }
