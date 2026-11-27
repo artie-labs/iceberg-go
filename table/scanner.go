@@ -582,6 +582,9 @@ type Scan struct {
 	// map cannot silently drop it.
 	arrowBatchSize int
 
+	// rowGroupProbe, when set, skips row groups none of whose rows it selects; see WithRowGroupProbe.
+	rowGroupProbe *rowGroupProbe
+
 	reporter metrics.Reporter
 }
 
@@ -2245,6 +2248,7 @@ func (scan *Scan) ReadTasks(ctx context.Context, tasks []FileScanTask) (*arrow.S
 		options:         scan.options,
 		concurrency:     scan.concurrency,
 		arrowBatchSize:  scan.arrowBatchSize,
+		rowGroupProbe:   scan.rowGroupProbe,
 	}).GetRecords(ctx, readTasks)
 	if err != nil {
 		// No iterator to drive cleanup on a setup error, so release here.

@@ -1337,6 +1337,32 @@ func WithArrowBatchSize(n int) ScanOption {
 	}
 }
 
+// RowMatcher reports, for each row of batch, whether it is a row the caller wants. A null entry is false. It runs on
+// several scan workers at once, so it must be safe for concurrent use. The caller releases the returned mask.
+type RowMatcher func(ctx context.Context, batch arrow.RecordBatch) (*array.Boolean, error)
+
+type rowGroupProbe struct {
+	columns []string
+	match   RowMatcher
+}
+
+// WithRowGroupProbe skips each Parquet row group in which match selects no row. Before reading a row group, the scan
+// reads only its columns, converted to the table's current names and types, and passes them to match one batch at a
+// time. The row group is read as usual as soon as match selects a row of it.
+//
+// It only decides which row groups are read. Every row of a kept row group is returned, so the caller still filters
+// rows, for example with WithRowFilter. It ignores deletes: a row group whose only selected rows are deleted is still
+// read, and deletes apply afterwards as usual. A data file that isn't Parquet, or that lacks one of columns because the
+// column was added later, is read without probing. An unknown column fails the scan.
+//
+// It pays off when the other selected columns are much wider than columns and the row filter can't prune row groups by
+// their statistics, for example a lookup of keys whose range spans the table. A kept row group has columns read twice.
+func WithRowGroupProbe(columns []string, match RowMatcher) ScanOption {
+	return func(scan *Scan) {
+		scan.rowGroupProbe = &rowGroupProbe{columns: slices.Clone(columns), match: match}
+	}
+}
+
 func (t Table) Scan(opts ...ScanOption) *Scan {
 	s := &Scan{
 		identifier:          slices.Clone(t.identifier),

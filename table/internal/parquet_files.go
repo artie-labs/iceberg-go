@@ -1938,6 +1938,15 @@ type ParquetRowGroupTester struct {
 	// file. It lets callers reconstruct each emitted row's original position even
 	// when pruning skips groups. Set to nil when no group is skipped.
 	Survivors *[]RowGroupSpan
+	// Probe, if non-nil, runs after the other tests on each row group they keep, and skips the row groups it rejects.
+	Probe *RowGroupProbe
+}
+
+// RowGroupProbe reads the leaf Columns of a row group, one record batch at a time, and keeps the row group at the
+// first batch Match accepts. A row group no batch is accepted from is skipped.
+type RowGroupProbe struct {
+	Columns []int
+	Match   func(arrow.RecordBatch) (bool, error)
 }
 
 // RowGroupSpan locates a surviving row group within the data file: the absolute
@@ -2054,7 +2063,7 @@ func (w wrapPqArrowReader) GetRecords(ctx context.Context, cols []int, tester an
 	var rgList []int
 	if rowGroupTester != nil && (rangeSet ||
 		rowGroupTester.StatsFn != nil || len(rowGroupTester.DictionaryPreds) > 0 ||
-		len(rowGroupTester.BloomPreds) > 0) {
+		len(rowGroupTester.BloomPreds) > 0 || rowGroupTester.Probe != nil) {
 		fileMeta := w.ParquetReader().MetaData()
 		numRg := w.ParquetReader().NumRowGroups()
 		planningOffsets := rowGroupTester.PlanningSplitOffsets
@@ -2157,6 +2166,14 @@ func (w wrapPqArrowReader) GetRecords(ctx context.Context, cols []int, tester an
 				}
 			}
 
+			if use && rowGroupTester.Probe != nil {
+				var err error
+				use, err = w.probeRowGroup(ctx, rg, rowGroupTester.Probe)
+				if err != nil {
+					return nil, err
+				}
+			}
+
 			if !use {
 				continue
 			}
@@ -2176,6 +2193,26 @@ func (w wrapPqArrowReader) GetRecords(ctx context.Context, cols []int, tester an
 	}
 
 	return w.GetRecordReader(ctx, cols, rgList)
+}
+
+// probeRowGroup reports whether probe accepts a batch of row group rg's probe columns.
+func (w wrapPqArrowReader) probeRowGroup(ctx context.Context, rg int, probe *RowGroupProbe) (bool, error) {
+	rdr, err := w.GetRecordReader(ctx, probe.Columns, []int{rg})
+	if err != nil {
+		return false, fmt.Errorf("row group probe: %w", err)
+	}
+	defer rdr.Release()
+
+	for rdr.Next() {
+		if matched, err := probe.Match(rdr.RecordBatch()); err != nil || matched {
+			return matched, err
+		}
+	}
+	if err := rdr.Err(); err != nil && !errors.Is(err, io.EOF) {
+		return false, fmt.Errorf("row group probe: %w", err)
+	}
+
+	return false, nil
 }
 
 // nonClosingReaderAtSeeker gives a temporary Parquet reader access to a shared

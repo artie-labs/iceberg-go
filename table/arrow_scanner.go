@@ -1250,6 +1250,11 @@ type arrowScan struct {
 	// deleteMatcher, when set, narrows the rows a merge-on-read delete scan reports; see WithDeleteRowMatcher.
 	deleteMatcher *deleteRowMatcher
 
+	// rowGroupProbe, when set, skips row groups none of whose rows it selects; see WithRowGroupProbe. probeSchema is
+	// its columns in scanSchema, set by GetRecords.
+	rowGroupProbe *rowGroupProbe
+	probeSchema   *iceberg.Schema
+
 	// arrowBatchSize, when positive, overrides the table's
 	// read.parquet.batch-size property for this scan's reads.
 	arrowBatchSize int
@@ -1915,7 +1920,7 @@ func (as *arrowScan) processRecords(
 	posSource *rowPositionSource,
 	sink *recordSink,
 ) error {
-	return as.processRecordsWithPlans(ctx, task, fileSchema, rowFilter, rdr, columns, pipeline, posSource, sink, nil)
+	return as.processRecordsWithPlans(ctx, task, fileSchema, rowFilter, rdr, columns, pipeline, posSource, sink, nil, nil)
 }
 
 // adjustParquetTaskRange keeps a planned range within the physical file when
@@ -1946,6 +1951,7 @@ func (as *arrowScan) processRecordsWithPlans(
 	posSource *rowPositionSource,
 	sink *recordSink,
 	plans *compiledFileFilterPlans,
+	probe *tblutils.RowGroupProbe,
 ) (err error) {
 	var (
 		testRowGroups any
@@ -2043,6 +2049,7 @@ func (as *arrowScan) processRecordsWithPlans(
 		if posSource != nil {
 			tester.Survivors = &posSource.spans
 		}
+		tester.Probe = probe
 		testRowGroups = tester
 	}
 
@@ -2271,9 +2278,74 @@ func (as *arrowScan) recordsFromTask(ctx context.Context, task tblutils.Enumerat
 		})
 	})
 
-	err = as.processRecordsWithPlans(ctx, task, iceSchema, rowFilter, rdr, colIndices, pipeline, posSource, sink, filterPlans)
+	var probe *tblutils.RowGroupProbe
+	if as.probeSchema != nil && task.Value.File.FileFormat() == iceberg.ParquetFile {
+		if probe, err = as.newRowGroupProbe(ctx, rdr, invariants); err != nil {
+			return err
+		}
+	}
+
+	err = as.processRecordsWithPlans(ctx, task, iceSchema, rowFilter, rdr, colIndices, pipeline, posSource, sink, filterPlans, probe)
 
 	return err
+}
+
+// newRowGroupProbe returns the probe for a Parquet file read by rdr, or nil when the file lacks one of the probe
+// columns. A file that predates a column reads it as the column's initial default, which the file can't be probed for.
+func (as *arrowScan) newRowGroupProbe(ctx context.Context, rdr tblutils.FileReader, invariants *arrowScanInvariants) (*tblutils.RowGroupProbe, error) {
+	ids := set[int]{}
+	for _, field := range as.probeSchema.Fields() {
+		collectLeafIDs(field.Type, field.ID, ids)
+	}
+	arrowSchema, columns, err := rdr.PrunedSchema(ids, invariants.nameMapping)
+	if err != nil {
+		return nil, fmt.Errorf("row group probe: %w", err)
+	}
+	fileSchema, err := ArrowSchemaToIcebergWithOptions(arrowSchema, ArrowToIcebergOptions{
+		NameMapping:     invariants.nameMapping,
+		TableSchema:     invariants.tableSchema,
+		TableProperties: invariants.tableProperties,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("row group probe: %w", err)
+	}
+	for id := range ids {
+		if _, ok := fileSchema.FindFieldByID(id); !ok {
+			return nil, nil
+		}
+	}
+
+	match := as.rowGroupProbe.match
+
+	return &tblutils.RowGroupProbe{Columns: columns, Match: func(batch arrow.RecordBatch) (bool, error) {
+		asTable, err := ToRequestedSchema(ctx, as.probeSchema, fileSchema, batch, SchemaOptions{
+			UseLargeTypes:   as.useLargeTypes,
+			TableProperties: invariants.tableProperties,
+		})
+		if err != nil {
+			return false, fmt.Errorf("row group probe: %w", err)
+		}
+		defer asTable.Release()
+
+		mask, err := match(ctx, asTable)
+		if err != nil {
+			return false, err
+		}
+		if mask == nil {
+			return false, errors.New("row group probe matcher returned no mask")
+		}
+		defer mask.Release()
+		if mask.Len() != int(batch.NumRows()) {
+			return false, fmt.Errorf("row group probe matcher returned %d values for %d rows", mask.Len(), batch.NumRows())
+		}
+		for i := range mask.Len() {
+			if mask.IsValid(i) && mask.Value(i) {
+				return true, nil
+			}
+		}
+
+		return false, nil
+	}}, nil
 }
 
 func (as *arrowScan) producePosDeletesFromTask(ctx context.Context, task tblutils.Enumerated[FileScanTask], positionalDeletes positionDeletes, sink *recordSink, invariants *arrowScanInvariants) (err error) {
@@ -2369,7 +2441,7 @@ func (as *arrowScan) producePosDeletesFromTask(ctx context.Context, task tblutil
 		return ToRequestedSchema(ctx, iceberg.PositionalDeleteSchema, enrichedIcebergSchema, r, SchemaOptions{IncludeFieldIDs: true, UseLargeTypes: as.useLargeTypes})
 	})
 
-	err = as.processRecordsWithPlans(ctx, task, iceSchema, as.boundRowFilter, rdr, colIndices, pipeline, posSource, sink, filterPlans)
+	err = as.processRecordsWithPlans(ctx, task, iceSchema, as.boundRowFilter, rdr, colIndices, pipeline, posSource, sink, filterPlans, nil)
 
 	return err
 }
@@ -2660,6 +2732,12 @@ func (as *arrowScan) GetRecords(ctx context.Context, tasks []FileScanTask) (*arr
 		ctx = tblutils.WithParquetMetadataCache(ctx)
 	} else {
 		as.cacheFileReadPlan = false
+	}
+
+	if as.rowGroupProbe != nil {
+		if as.probeSchema, err = as.scanSchema.Select(as.caseSensitive, as.rowGroupProbe.columns...); err != nil {
+			return nil, nil, fmt.Errorf("row group probe: %w", err)
+		}
 	}
 
 	invariants, err := as.scanInvariants(tableProperties)

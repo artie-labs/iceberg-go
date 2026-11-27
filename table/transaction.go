@@ -2563,7 +2563,7 @@ type deleteOperation struct {
 // DeleteRowMatcher reports, for each row of a batch the delete filter matched, whether to delete it. The batch holds
 // the matcher's columns and the filter's, under their schema names. It runs on several scan workers at once, so it
 // must be safe for concurrent use. The caller releases the returned mask; a null entry keeps the row.
-type DeleteRowMatcher func(ctx context.Context, batch arrow.RecordBatch) (*array.Boolean, error)
+type DeleteRowMatcher = RowMatcher
 
 type deleteRowMatcher struct {
 	columns []string
