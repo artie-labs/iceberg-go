@@ -263,3 +263,36 @@ func TestParquetRowGroupFilter_MissingColumn(t *testing.T) {
 			rowGroupMatches(t, rdr, schema, iceberg.EqualTo(iceberg.Reference("extra"), "x")))
 	}
 }
+
+func TestParquetRowGroupFilter_Errors(t *testing.T) {
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64},
+		iceberg.NestedField{ID: 2, Name: "other", Type: iceberg.PrimitiveTypes.String})
+	column := int64Column(int64Range(0, 100)...)
+	defer column.Release()
+	rdr := writeRowGroupFilterFile(t, column, 50, parquet.WithDictionaryDefault(false))
+
+	{
+		// A file schema without a filter column the file has would read it as null and prune every row group.
+		_, err := table.NewParquetRowGroupFilter(rdr, schema, iceberg.NewSchema(0, schema.Field(1)),
+			iceberg.EqualTo(iceberg.Reference("id"), int64(1)), true)
+		require.EqualError(t, err, "invalid argument: file schema lacks filter field 1, which the Parquet file has")
+	}
+	{
+		// Leaving out a column the filter doesn't use is fine.
+		rowGroups, err := table.NewParquetRowGroupFilter(rdr, schema, iceberg.NewSchema(0, schema.Field(0)),
+			iceberg.EqualTo(iceberg.Reference("id"), int64(1)), true)
+		require.NoError(t, err)
+		for rg, want := range []bool{true, false} {
+			got, err := rowGroups.MightMatch(rg)
+			require.NoError(t, err)
+			require.Equal(t, want, got)
+		}
+
+		_, err = rowGroups.MightMatch(2)
+		require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+		require.EqualError(t, err, "invalid argument: row group 2 of 2")
+		_, err = rowGroups.MightMatch(-1)
+		require.EqualError(t, err, "invalid argument: row group -1 of 2")
+	}
+}

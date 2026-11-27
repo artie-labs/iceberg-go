@@ -18,6 +18,7 @@
 package table
 
 import (
+	"fmt"
 	"slices"
 
 	"github.com/apache/arrow-go/v18/parquet/file"
@@ -32,15 +33,19 @@ import (
 // checks the values of an IN set only when there are at most 200 of them, and
 // otherwise only their range. It is not safe for concurrent use.
 type ParquetRowGroupFilter struct {
-	checker *tblutils.RowGroupChecker
+	checker   *tblutils.RowGroupChecker
+	rowGroups int
 }
 
 // NewParquetRowGroupFilter returns the row group filter of rowFilter for the
 // Parquet file that rdr reads. rowFilter is unbound and refers to columns of
 // schema by name, as in [WithRowFilter]. schema is usually the table's current
-// schema. fileSchema is the file's schema with the table's
-// field IDs, as [ArrowSchemaToIcebergWithOptions] returns it for the file's
-// Arrow schema. It may hold only the columns rowFilter refers to.
+// schema. fileSchema is the file's schema with the table's field IDs and the
+// file's own types, as [ArrowSchemaToIcebergWithOptions] returns it for the
+// file's Arrow schema. It must hold every column rowFilter refers to that the
+// file has, and may leave out the rest. A filter column it lacks while the
+// file has it is an error, since it would read as null and prune row groups
+// that match.
 //
 // A column the file lacks is read as null, or as its initial default, as in a
 // scan. A filter on a column with an initial default that the file lacks
@@ -59,6 +64,18 @@ func NewParquetRowGroupFilter(
 	if err != nil {
 		return nil, err
 	}
+	filterIDs, err := iceberg.ExtractFieldIDs(bound)
+	if err != nil {
+		return nil, err
+	}
+	columns := rdr.MetaData().Schema
+	for i := range columns.NumColumns() {
+		id := int(columns.Column(i).SchemaNode().FieldID())
+		if _, ok := fileSchema.FindFieldByID(id); !ok && slices.Contains(filterIDs, id) {
+			return nil, fmt.Errorf("%w: file schema lacks filter field %d, which the Parquet file has",
+				iceberg.ErrInvalidArgument, id)
+		}
+	}
 	plan, err := compilePruningPlan(fileSchema, schema, bound, caseSensitive)
 	if err != nil {
 		return nil, err
@@ -72,7 +89,6 @@ func NewParquetRowGroupFilter(
 		if err != nil {
 			return nil, err
 		}
-		columns := rdr.MetaData().Schema
 		for i := range columns.NumColumns() {
 			if slices.Contains(fieldIDs, int(columns.Column(i).SchemaNode().FieldID())) {
 				cols = append(cols, i)
@@ -81,12 +97,17 @@ func NewParquetRowGroupFilter(
 	}
 
 	return &ParquetRowGroupFilter{
-		checker: tblutils.NewRowGroupChecker(plan.rowGroupTester(), rdr, cols),
+		checker:   tblutils.NewRowGroupChecker(plan.rowGroupTester(), rdr, cols),
+		rowGroups: rdr.NumRowGroups(),
 	}, nil
 }
 
 // MightMatch reports whether row group rowGroup may hold a row that matches
 // the filter. False means it holds none.
 func (f *ParquetRowGroupFilter) MightMatch(rowGroup int) (bool, error) {
+	if rowGroup < 0 || rowGroup >= f.rowGroups {
+		return false, fmt.Errorf("%w: row group %d of %d", iceberg.ErrInvalidArgument, rowGroup, f.rowGroups)
+	}
+
 	return f.checker.Keep(rowGroup)
 }
