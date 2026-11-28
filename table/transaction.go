@@ -2477,7 +2477,13 @@ func (t *Transaction) performCopyOnWriteDeletion(ctx context.Context, operation 
 	}
 
 	if len(filesToRewrite) > 0 {
-		if err := t.rewriteFilesWithFilter(ctx, fs, updater, filesToRewrite, fileSeqByPath, filter, caseSensitive, concurrency); err != nil {
+		// A rewritten file replaces its original and every delete file that applies to it, so it is read with those
+		// deletes: otherwise rows they already deleted would come back.
+		deletes, err := t.plannedDeletesForFilter(ctx, meta, filter, caseSensitive, concurrency)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := t.rewriteFilesWithFilter(ctx, fs, updater, filesToRewrite, fileSeqByPath, deletes, filter, caseSensitive, concurrency); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -2850,9 +2856,10 @@ func (t *Transaction) classifyFilesForFilteredDeletions(ctx context.Context, fs 
 // rewriteFilesWithFilter rewrites data files by preserving only rows the filter is not true for. A row the filter
 // evaluates to null on (a comparison on a null column) is kept, since Delete removes only rows the filter matches.
 // fileSeqByPath maps each file's path to its file_sequence_number from the source manifest entry,
-// used to synthesize _last_updated_sequence_number when the source row's value is null. The
+// used to synthesize _last_updated_sequence_number when the source row's value is null. deletes maps
+// each file's path to its planned scan task, whose delete files are applied when the file is read. The
 // filter binding and substrait conversion are computed once here and reused across every file.
-func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, updater *snapshotProducer, files []iceberg.DataFile, fileSeqByPath map[string]*int64, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) error {
+func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, updater *snapshotProducer, files []iceberg.DataFile, fileSeqByPath map[string]*int64, deletes map[string]FileScanTask, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) error {
 	meta, err := t.txnMeta()
 	if err != nil {
 		return err
@@ -2874,6 +2881,7 @@ func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, upda
 			fs:            fs,
 			originalFile:  originalFile,
 			fileSeqNum:    fileSeqByPath[originalFile.FilePath()],
+			deletes:       deletes[originalFile.FilePath()],
 			postFilter:    postFilter,
 			caseSensitive: caseSensitive,
 			commitUUID:    rewriteUUID,
@@ -2903,6 +2911,10 @@ type rewriteSingleFileArgs struct {
 	// manifest entry; required to synthesize _last_updated_sequence_number
 	// for rows whose value is null in the source file.
 	fileSeqNum *int64
+	// deletes is the file's planned scan task; its position deletes, equality
+	// deletes and deletion vectors are applied when the file is read. A zero
+	// value applies none.
+	deletes FileScanTask
 	// postFilter keeps the rows that survive the rewrite: those the delete
 	// filter is not true for. It is the only place the filter is evaluated.
 	// The scanner reads every row, unfiltered and unpruned, so a row the
@@ -2924,9 +2936,12 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 	}
 
 	scanTask := &FileScanTask{
-		File:   args.originalFile,
-		Start:  0,
-		Length: args.originalFile.FileSizeBytes(),
+		File:                args.originalFile,
+		DeleteFiles:         args.deletes.DeleteFiles,
+		EqualityDeleteFiles: args.deletes.EqualityDeleteFiles,
+		DeletionVectorFiles: args.deletes.DeletionVectorFiles,
+		Start:               0,
+		Length:              args.originalFile.FileSizeBytes(),
 	}
 
 	// Preserve row lineage for v3 tables: include _row_id and
@@ -3255,6 +3270,24 @@ func legacyPositionDeleteBitmaps(ctx context.Context, fs io.IO, files []iceberg.
 // vector instead, since readers ignore a file's Parquet position deletes once it has one. Rows removed by equality deletes still
 // match and get position deletes, which only inflates the totals.
 func (t *Transaction) positionDeletesForFilter(ctx context.Context, meta *MetadataBuilder, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) (map[string][]iceberg.DataFile, error) {
+	planned, err := t.plannedDeletesForFilter(ctx, meta, filter, caseSensitive, concurrency)
+	if err != nil {
+		return nil, err
+	}
+	deletes := make(map[string][]iceberg.DataFile, len(planned))
+	for path, task := range planned {
+		if len(task.DeleteFiles) > 0 {
+			deletes[path] = task.DeleteFiles
+		}
+	}
+
+	return deletes, nil
+}
+
+// plannedDeletesForFilter plans the data files filter may match on the transaction's planning snapshot and returns
+// each one's scan task, keyed by data file path, for the delete files that apply to it. A delete file is kept even
+// when its stats can't match filter: it still applies to the rows filter doesn't match.
+func (t *Transaction) plannedDeletesForFilter(ctx context.Context, meta *MetadataBuilder, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) (map[string]FileScanTask, error) {
 	snapshot := t.planningSnapshot(meta)
 	if snapshot == nil {
 		return nil, nil
@@ -3267,18 +3300,17 @@ func (t *Transaction) positionDeletesForFilter(ctx context.Context, meta *Metada
 	// Bind the filter to the current schema, as the delete does: it may name a column added after snapshot was written.
 	currentSchema := false
 	scan.useSnapshotSchema = &currentSchema
+	scan.keepDeletesOutsideFilter = true
 	planned, err := scan.PlanFiles(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to plan existing position deletes: %w", err)
+		return nil, fmt.Errorf("failed to plan existing deletes: %w", err)
 	}
-	deletes := make(map[string][]iceberg.DataFile, len(planned))
+	tasks := make(map[string]FileScanTask, len(planned))
 	for _, task := range planned {
-		if len(task.DeleteFiles) > 0 {
-			deletes[task.File.FilePath()] = task.DeleteFiles
-		}
+		tasks[task.File.FilePath()] = task
 	}
 
-	return deletes, nil
+	return tasks, nil
 }
 
 func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs io.IO, files []iceberg.DataFile, existingDeletes map[string][]iceberg.DataFile, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int, matcher *deleteRowMatcher) (seq2 iter.Seq2[arrow.RecordBatch, error], err error) {
