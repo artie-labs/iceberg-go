@@ -2642,9 +2642,10 @@ type deleteOperation struct {
 	rowMatcher    *deleteRowMatcher
 }
 
-// DeleteRowMatcher reports, for each row of a batch the delete filter matched, whether to delete it. The batch holds
-// the matcher's columns and the filter's, under their schema names. It runs on several scan workers at once, so it
-// must be safe for concurrent use. The caller releases the returned mask; a null entry keeps the row.
+// DeleteRowMatcher reports, for each row of a batch the delete filter matched, whether to delete it. Matchers must
+// look up columns by schema name rather than position: merge-on-read projects the matcher and filter columns, while
+// copy-on-write passes all top-level user columns. It runs on several scan workers at once, so it must be safe for
+// concurrent use. The caller releases the returned mask; a null entry keeps the row.
 type DeleteRowMatcher func(ctx context.Context, batch arrow.RecordBatch) (*array.Boolean, error)
 
 type deleteRowMatcher struct {
@@ -3106,7 +3107,7 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 		scanTask.DataSequenceNumber = args.fileSeqNum
 	}
 
-	builtMeta, err := meta.Build()
+	builtMeta, err := buildScanMetadata(meta)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to build metadata: %w", err)
 	}
@@ -3199,9 +3200,11 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 
 	if args.skipIfUnchanged {
 		if deletedRows == 0 {
-			_, removeErr := removeDataFiles(wfs, result)
-			if removeErr != nil {
-				return nil, false, removeErr
+			// Copy-on-write streams each candidate file straight through the writer in a single pass, so a file whose
+			// matcher deletes zero rows still writes temporary output files that are removed here. Cleanup is
+			// best-effort so a transient remove failure does not fail an unchanged file.
+			if _, removeErr := removeDataFiles(wfs, result); removeErr != nil {
+				slog.Warn("failed to remove unchanged rewritten files", "file", args.originalFile.FilePath(), "error", removeErr)
 			}
 
 			return nil, false, nil
@@ -3804,6 +3807,7 @@ func (t *Transaction) recordStagedFiles(paths []string) {
 	t.stagedFiles = append(t.stagedFiles, paths...)
 	t.stagedMu.Unlock()
 }
+
 func removeDataFiles(wfs io.WriteFileIO, files []iceberg.DataFile) ([]string, error) {
 	paths := make([]string, len(files))
 	for i, df := range files {
