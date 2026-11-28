@@ -23,9 +23,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	iofs "io/fs"
 	"iter"
 	"log/slog"
 	"maps"
+	"os"
 	"runtime"
 	"slices"
 	"strconv"
@@ -2874,6 +2876,12 @@ func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, upda
 		return err
 	}
 
+	wfs, err := requireWriteFileIO(fs)
+	if err != nil {
+		return err
+	}
+
+	var writtenPaths []string
 	for _, originalFile := range files {
 		// Use a separate UUID for rewrite operations to avoid filename collisions with new data files
 		rewriteUUID := uuid.New()
@@ -2889,11 +2897,15 @@ func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, upda
 		}
 		rewrittenFiles, err := t.rewriteSingleFile(ctx, args)
 		if err != nil {
-			return fmt.Errorf("failed to rewrite file %s: %w", originalFile.FilePath(), err)
+			_, removeErr := removeStagedPaths(wfs, writtenPaths)
+
+			return errors.Join(fmt.Errorf("failed to rewrite file %s: %w", originalFile.FilePath(), err), removeErr)
 		}
 
 		updater.deleteDataFile(originalFile)
 		for _, rewrittenFile := range rewrittenFiles {
+			path := rewrittenFile.FilePath()
+			writtenPaths = append(writtenPaths, path)
 			updater.appendDataFile(rewrittenFile)
 		}
 	}
@@ -3049,7 +3061,9 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 
 	for df, err := range itr {
 		if err != nil {
-			return nil, err
+			_, removeErr := removeDataFiles(wfs, result)
+
+			return nil, errors.Join(err, removeErr)
 		}
 		result = append(result, df)
 	}
@@ -3128,6 +3142,21 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 	if err != nil {
 		return nil, err
 	}
+	releasePosDeleteRecIter := func(yield func(arrow.RecordBatch, error) bool) {
+		for rec, err := range posDeleteRecIter {
+			if err != nil {
+				yield(nil, err)
+
+				return
+			}
+			if !yield(rec, nil) {
+				rec.Release()
+
+				return
+			}
+			rec.Release()
+		}
+	}
 
 	partitionContextByFilePath := make(map[string]partitionContext, len(files))
 	for _, df := range files {
@@ -3136,23 +3165,30 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 
 	posDeleteFiles := positionDeleteRecordsToDataFiles(ctx, t.tbl.Location(), meta, partitionContextByFilePath, recordWritingArgs{
 		sc:          PositionalDeleteArrowSchema,
-		itr:         posDeleteRecIter,
+		itr:         releasePosDeleteRecIter,
 		writeUUID:   &commitUUID,
 		fs:          wfs,
 		existingDVs: existingDVBitmaps,
 	})
 
 	var referenced []string
+	var writtenPaths []string
 	seen := make(map[string]struct{})
 	for f, err := range posDeleteFiles {
 		if err != nil {
-			return nil, err
+			_, removeErr := removeStagedPaths(wfs, writtenPaths)
+
+			return nil, errors.Join(err, removeErr)
 		}
+		path := f.FilePath()
+		writtenPaths = append(writtenPaths, path)
 		updater.appendDeleteFile(f)
-		if ref := iceberginternal.BorrowedDataFileReferencedDataFile(f); ref != nil && *ref != "" {
-			if _, ok := seen[*ref]; !ok {
-				seen[*ref] = struct{}{}
-				referenced = append(referenced, *ref)
+		if ref := iceberginternal.BorrowedDataFileReferencedDataFile(f); ref != nil {
+			if *ref != "" {
+				if _, ok := seen[*ref]; !ok {
+					seen[*ref] = struct{}{}
+					referenced = append(referenced, *ref)
+				}
 			}
 		}
 	}
@@ -3566,6 +3602,44 @@ func (t *Transaction) Commit(ctx context.Context) (*Table, error) {
 	t.committed = true
 
 	return t.tbl, nil
+}
+
+func removeDataFiles(wfs io.WriteFileIO, files []iceberg.DataFile) ([]string, error) {
+	paths := make([]string, len(files))
+	for i, df := range files {
+		paths[i] = df.FilePath()
+	}
+
+	return removeStagedPaths(wfs, paths)
+}
+
+func removeStagedPaths(wfs io.WriteFileIO, paths []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(paths))
+	var remaining []string
+	var removeErr error
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		if _, dup := seen[path]; dup {
+			continue
+		}
+		seen[path] = struct{}{}
+		err := wfs.Remove(path)
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, iofs.ErrNotExist) {
+			continue
+		}
+		if os.IsNotExist(err) {
+			continue
+		}
+		remaining = append(remaining, path)
+		removeErr = errors.Join(removeErr, fmt.Errorf("remove staged file %s: %w", path, err))
+	}
+
+	return remaining, removeErr
 }
 
 func validateGCEnabledForSnapshotExpiration(props iceberg.Properties) error {
