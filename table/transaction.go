@@ -23,9 +23,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	iofs "io/fs"
 	"iter"
 	"log/slog"
 	"maps"
+	"os"
 	"runtime"
 	"slices"
 	"strconv"
@@ -112,6 +114,19 @@ type Transaction struct {
 
 	mx        sync.Mutex
 	committed bool
+	aborted   bool
+
+	stagedMu    sync.Mutex
+	stagedFiles []string
+}
+
+func (t *Transaction) recordStagedFile(path string) {
+	if path == "" {
+		return
+	}
+	t.stagedMu.Lock()
+	t.stagedFiles = append(t.stagedFiles, path)
+	t.stagedMu.Unlock()
 }
 
 func (t *Transaction) ensureInitialized() error {
@@ -167,6 +182,9 @@ func (t *Transaction) apply(updates []Update, reqs []Requirement) error {
 
 	if t.committed {
 		return errors.New("transaction has already been committed")
+	}
+	if t.aborted {
+		return errors.New("transaction has been aborted")
 	}
 
 	stagedMeta := meta.clone()
@@ -909,6 +927,7 @@ func (t *Transaction) Append(ctx context.Context, rdr array.RecordReader, snapsh
 		if err != nil {
 			return err
 		}
+		t.recordStagedFile(df.FilePath())
 		appendFiles.appendDataFile(df)
 	}
 
@@ -2408,6 +2427,7 @@ func (t *Transaction) Overwrite(ctx context.Context, rdr array.RecordReader, sna
 		if err != nil {
 			return err
 		}
+		t.recordStagedFile(df.FilePath())
 		updater.appendDataFile(df)
 	}
 
@@ -2886,6 +2906,7 @@ func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, upda
 
 		updater.deleteDataFile(originalFile)
 		for _, rewrittenFile := range rewrittenFiles {
+			t.recordStagedFile(rewrittenFile.FilePath())
 			updater.appendDataFile(rewrittenFile)
 		}
 	}
@@ -3133,6 +3154,7 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 		if err != nil {
 			return nil, err
 		}
+		t.recordStagedFile(f.FilePath())
 		updater.appendDeleteFile(f)
 		if ref := iceberginternal.BorrowedDataFileReferencedDataFile(f); ref != nil && *ref != "" {
 			if _, ok := seen[*ref]; !ok {
@@ -3496,6 +3518,9 @@ func (t *Transaction) Commit(ctx context.Context) (*Table, error) {
 	if t.committed {
 		return nil, errors.New("transaction has already been committed")
 	}
+	if t.aborted {
+		return nil, errors.New("transaction has been aborted")
+	}
 
 	if len(meta.updates) > 0 {
 		reqs := append(transactionRequirements(t.reqs, t.branch, t.tbl.metadata), AssertTableUUID(meta.uuid))
@@ -3507,10 +3532,14 @@ func (t *Transaction) Commit(ctx context.Context) (*Table, error) {
 		)
 		if err != nil {
 			// A clean conflict (ErrCommitFailed) committed nothing and stays
-			// retriable. Any other failure leaves the commit state unknown
-			// (the catalog may have accepted it), so mark it terminal to
-			// avoid a double-apply on retry.
-			if !errors.Is(err, ErrCommitFailed) {
+			// retriable. ErrCommitDiverged failed validation before CommitTable
+			// was sent, so it cannot be retried but its staged files are safe
+			// to clean up. Any other failure leaves the commit state unknown
+			// (the catalog may have accepted it), so mark it committed to
+			// prevent both retries and staged-file deletion.
+			if errors.Is(err, ErrCommitDiverged) {
+				t.aborted = true
+			} else if !errors.Is(err, ErrCommitFailed) {
 				t.committed = true
 			}
 
@@ -3534,6 +3563,91 @@ func (t *Transaction) Commit(ctx context.Context) (*Table, error) {
 	t.committed = true
 
 	return t.tbl, nil
+}
+
+// CleanupStagedFiles removes data, delete, manifest, and manifest-list files written by this transaction when it has
+// not been committed and did not end in an uncertain commit outcome. Once Commit succeeds or fails with a non-conflict
+// error whose catalog outcome is unknown, t.committed is true and CleanupStagedFiles is a no-op so referenced files
+// are never removed. Calling CleanupStagedFiles marks the transaction aborted so it cannot be committed afterwards;
+// if resolving FileIO or removing a subset of files fails, the unremoved paths remain tracked so a retry with a fresh
+// context can complete cleanup.
+func (t *Transaction) CleanupStagedFiles(ctx context.Context) error {
+	if err := t.checkNotNil(); err != nil {
+		return err
+	}
+	t.mx.Lock()
+	if t.committed {
+		t.mx.Unlock()
+
+		return nil
+	}
+	t.aborted = true
+	t.mx.Unlock()
+
+	t.stagedMu.Lock()
+	paths := t.stagedFiles
+	t.stagedFiles = nil
+	t.stagedMu.Unlock()
+
+	if len(paths) == 0 {
+		return nil
+	}
+
+	fs, err := t.tbl.fsF(ctx)
+	if err != nil {
+		t.recordStagedFiles(paths)
+
+		return err
+	}
+	wfs, err := requireWriteFileIO(fs)
+	if err != nil {
+		t.recordStagedFiles(paths)
+
+		return err
+	}
+
+	remaining, removeErr := removeStagedPaths(wfs, paths)
+	t.recordStagedFiles(remaining)
+
+	return removeErr
+}
+
+func (t *Transaction) recordStagedFiles(paths []string) {
+	if len(paths) == 0 {
+		return
+	}
+	t.stagedMu.Lock()
+	t.stagedFiles = append(t.stagedFiles, paths...)
+	t.stagedMu.Unlock()
+}
+
+func removeStagedPaths(wfs io.WriteFileIO, paths []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(paths))
+	var remaining []string
+	var removeErr error
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		if _, dup := seen[path]; dup {
+			continue
+		}
+		seen[path] = struct{}{}
+		err := wfs.Remove(path)
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, iofs.ErrNotExist) {
+			continue
+		}
+		if os.IsNotExist(err) {
+			continue
+		}
+		remaining = append(remaining, path)
+		removeErr = errors.Join(removeErr, fmt.Errorf("remove staged file %s: %w", path, err))
+	}
+
+	return remaining, removeErr
 }
 
 func validateGCEnabledForSnapshotExpiration(props iceberg.Properties) error {

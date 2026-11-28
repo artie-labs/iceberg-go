@@ -19,8 +19,11 @@ package table_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -200,4 +203,88 @@ func TestDeleteRowMatcher(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, []int64{1, 3}, idsInTable(t, tbl))
 	})
+	t.Run("CleanupStagedFiles removes uncommitted and conflicted files but preserves uncertain or committed files", func(t *testing.T) {
+		tbl := newTable(t, "2")
+		location := strings.TrimPrefix(tbl.Location(), "file://")
+		listDataFiles := func() []string {
+			matches, err := filepath.Glob(filepath.Join(location, "data", "*"))
+			require.NoError(t, err)
+
+			return matches
+		}
+		before := listDataFiles()
+
+		// Pre-commit abort cleans up staged delete files.
+		txn := tbl.NewTransaction()
+		require.NoError(t, txn.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), int64(1)), nil))
+		assert.Greater(t, len(listDataFiles()), len(before))
+		require.NoError(t, txn.CleanupStagedFiles(ctx))
+		assert.Equal(t, before, listDataFiles())
+
+		// Definite conflict (ErrCommitFailed) leaves transaction uncommitted so CleanupStagedFiles removes staged files.
+		conflictCat := &fixedCommitErrCatalog{err: table.ErrCommitFailed}
+		conflictTbl := table.New(tbl.Identifier(), tbl.Metadata(), tbl.MetadataLocation(), tbl.FS, conflictCat)
+		conflictTxn := conflictTbl.NewTransaction()
+		require.NoError(t, conflictTxn.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), int64(2)), nil))
+		assert.Greater(t, len(listDataFiles()), len(before))
+		_, err := conflictTxn.Commit(ctx)
+		require.ErrorIs(t, err, table.ErrCommitFailed)
+		require.NoError(t, conflictTxn.CleanupStagedFiles(ctx))
+		assert.Equal(t, before, listDataFiles())
+
+		// Uncertain commit error (non-ErrCommitFailed) marks transaction committed so CleanupStagedFiles keeps staged files.
+		uncertainErr := errors.New("connection reset after write")
+		uncertainCat := &fixedCommitErrCatalog{err: uncertainErr}
+		uncertainTbl := table.New(tbl.Identifier(), tbl.Metadata(), tbl.MetadataLocation(), tbl.FS, uncertainCat)
+		uncertainTxn := uncertainTbl.NewTransaction()
+		require.NoError(t, uncertainTxn.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), int64(3)), nil))
+		stagedCount := len(listDataFiles())
+		assert.Greater(t, stagedCount, len(before))
+		_, err = uncertainTxn.Commit(ctx)
+		require.ErrorIs(t, err, uncertainErr)
+		require.NoError(t, uncertainTxn.CleanupStagedFiles(ctx))
+		assert.Equal(t, stagedCount, len(listDataFiles()))
+		for _, path := range listDataFiles() {
+			_, statErr := os.Stat(path)
+			require.NoError(t, statErr)
+		}
+
+		// CleanupStagedFiles retains paths when fsF fails (e.g., cancelled context), so a retry cleans them up and Commit stays blocked.
+		ctxErr := errors.New("canceled fs lookup")
+		ctxAwareFS := func(c context.Context) (iceio.IO, error) {
+			if c.Err() != nil {
+				return nil, ctxErr
+			}
+
+			return tbl.FS(c)
+		}
+		retryCleanTbl := table.New(tbl.Identifier(), tbl.Metadata(), tbl.MetadataLocation(), ctxAwareFS, &fixedCommitErrCatalog{err: table.ErrCommitDiverged})
+		retryTxn := retryCleanTbl.NewTransaction()
+		require.NoError(t, retryTxn.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), int64(4)), nil))
+		afterStage := len(listDataFiles())
+		assert.Greater(t, afterStage, stagedCount)
+		_, err = retryTxn.Commit(ctx)
+		require.ErrorIs(t, err, table.ErrCommitDiverged)
+
+		canceledCtx, cancel := context.WithCancel(ctx)
+		cancel()
+		require.ErrorIs(t, retryTxn.CleanupStagedFiles(canceledCtx), ctxErr)
+		assert.Equal(t, afterStage, len(listDataFiles()))
+		require.NoError(t, retryTxn.CleanupStagedFiles(ctx))
+		assert.Equal(t, stagedCount, len(listDataFiles()))
+		_, err = retryTxn.Commit(ctx)
+		assert.ErrorContains(t, err, "aborted")
+	})
+}
+
+type fixedCommitErrCatalog struct {
+	err error
+}
+
+func (c *fixedCommitErrCatalog) LoadTable(context.Context, table.Identifier) (*table.Table, error) {
+	return nil, errors.New("unexpected LoadTable")
+}
+
+func (c *fixedCommitErrCatalog) CommitTable(context.Context, table.Identifier, []table.Requirement, []table.Update) (table.Metadata, string, error) {
+	return nil, "", c.err
 }
