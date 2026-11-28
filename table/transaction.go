@@ -2386,7 +2386,7 @@ func (t *Transaction) Overwrite(ctx context.Context, rdr array.RecordReader, sna
 		apply(&overwrite)
 	}
 
-	updater, wfs, err := t.performCopyOnWriteDeletion(ctx, OpOverwrite, snapshotProps, overwrite.filter, overwrite.caseSensitive, overwrite.concurrency)
+	updater, wfs, err := t.performCopyOnWriteDeletion(ctx, OpOverwrite, snapshotProps, overwrite.filter, overwrite.caseSensitive, overwrite.concurrency, nil)
 	if err != nil {
 		return err
 	}
@@ -2439,9 +2439,12 @@ func (t *Transaction) Overwrite(ctx context.Context, rdr array.RecordReader, sna
 	return t.apply(updates, reqs)
 }
 
-func (t *Transaction) performCopyOnWriteDeletion(ctx context.Context, operation Operation, snapshotProps iceberg.Properties, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) (*snapshotProducer, io.WriteFileIO, error) {
+func (t *Transaction) performCopyOnWriteDeletion(ctx context.Context, operation Operation, snapshotProps iceberg.Properties, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int, matcher *deleteRowMatcher) (*snapshotProducer, io.WriteFileIO, error) {
 	meta, err := t.txnMeta()
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := validateDeleteRowMatcherColumns(meta.CurrentSchema(), matcher, caseSensitive); err != nil {
 		return nil, nil, err
 	}
 	fs, err := t.tbl.fsF(ctx)
@@ -2453,15 +2456,17 @@ func (t *Transaction) performCopyOnWriteDeletion(ctx context.Context, operation 
 		return nil, nil, err
 	}
 
-	if err := t.ensureNameMapping(); err != nil {
-		return nil, nil, err
+	if matcher == nil {
+		if err := t.ensureNameMapping(); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	commitUUID := uuid.New()
 	updater := t.updateSnapshot(wfs, snapshotProps, operation).mergeOverwrite(&commitUUID, filter)
 	updater.setManifestConcurrency(concurrency)
 
-	filesToDelete, filesToRewrite, fileSeqByPath, err := t.classifyFilesForDeletions(ctx, fs, filter, caseSensitive, concurrency)
+	filesToDelete, filesToRewrite, fileSeqByPath, err := t.classifyFilesForDeletions(ctx, fs, filter, caseSensitive, concurrency, matcher != nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2477,7 +2482,7 @@ func (t *Transaction) performCopyOnWriteDeletion(ctx context.Context, operation 
 		if err != nil {
 			return nil, nil, err
 		}
-		if err := t.rewriteFilesWithFilter(ctx, fs, updater, filesToRewrite, fileSeqByPath, deletes, filter, caseSensitive, concurrency); err != nil {
+		if err := t.rewriteFilesWithFilter(ctx, fs, updater, filesToRewrite, fileSeqByPath, deletes, filter, caseSensitive, concurrency, matcher); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -2512,16 +2517,11 @@ func (t *Transaction) performMergeOnReadDeletion(ctx context.Context, snapshotPr
 	updater := t.updateSnapshot(wfs, snapshotProps, OpDelete).mergeOverwrite(&commitUUID, filter)
 	updater.setManifestConcurrency(concurrency)
 
-	filesToDelete, withPartialDeletions, _, err := t.classifyFilesForDeletions(ctx, fs, filter, caseSensitive, concurrency)
+	filesToDelete, withPartialDeletions, _, err := t.classifyFilesForDeletions(ctx, fs, filter, caseSensitive, concurrency, matcher != nil)
 	if err != nil {
 		return nil, err
 	}
 
-	if matcher != nil {
-		// The filter only matches a superset, so a file it matches whole may still keep rows.
-		withPartialDeletions = append(withPartialDeletions, filesToDelete...)
-		filesToDelete = nil
-	}
 	for _, df := range filesToDelete {
 		updater.deleteDataFile(df)
 	}
@@ -2609,7 +2609,7 @@ type deleteRowMatcher struct {
 // columns match reads. The filter must then
 // match a superset of the rows to delete; it still prunes files and row groups. Use it when the exact rows are cheap to
 // test in Go but expensive as an expression, such as many composite keys: an OR of one conjunction per key is
-// evaluated against every row. Only merge-on-read deletes support it; a copy-on-write Delete returns an error.
+// evaluated against every row. Supported for both merge-on-read and copy-on-write deletes.
 func WithDeleteRowMatcher(columns []string, match DeleteRowMatcher) DeleteOption {
 	return func(op *deleteOperation) {
 		op.rowMatcher = &deleteRowMatcher{columns: columns, match: match}
@@ -2672,12 +2672,9 @@ func (t *Transaction) Delete(ctx context.Context, filter iceberg.BooleanExpressi
 	if meta.formatVersion > 1 {
 		writeDeleteMode = meta.props.Get(WriteDeleteModeKey, WriteDeleteModeDefault)
 	}
-	if deleteOp.rowMatcher != nil && writeDeleteMode != WriteModeMergeOnRead {
-		return fmt.Errorf("a delete row matcher needs %s=%s, not %q", WriteDeleteModeKey, WriteModeMergeOnRead, writeDeleteMode)
-	}
 	switch writeDeleteMode {
 	case WriteModeCopyOnWrite:
-		updater, _, err = t.performCopyOnWriteDeletion(ctx, OpDelete, snapshotProps, filter, deleteOp.caseSensitive, deleteOp.concurrency)
+		updater, _, err = t.performCopyOnWriteDeletion(ctx, OpDelete, snapshotProps, filter, deleteOp.caseSensitive, deleteOp.concurrency, deleteOp.rowMatcher)
 		if err != nil {
 			return err
 		}
@@ -2711,7 +2708,7 @@ func (t *Transaction) Delete(ctx context.Context, filter iceberg.BooleanExpressi
 // Returns files to delete completely, files to rewrite partially, the
 // per-file file_sequence_number map for rewrite candidates (used to
 // synthesize row-lineage columns when reading), and any error.
-func (t *Transaction) classifyFilesForDeletions(ctx context.Context, fs io.IO, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) (filesToDelete, filesWithPartialDeletions []iceberg.DataFile, fileSeqByPath map[string]*int64, err error) {
+func (t *Transaction) classifyFilesForDeletions(ctx context.Context, fs io.IO, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int, keepWholeFiles bool) (filesToDelete, filesWithPartialDeletions []iceberg.DataFile, fileSeqByPath map[string]*int64, err error) {
 	meta, err := t.txnMeta()
 	if err != nil {
 		return nil, nil, nil, err
@@ -2722,7 +2719,18 @@ func (t *Transaction) classifyFilesForDeletions(ctx context.Context, fs io.IO, f
 		return nil, nil, nil, nil
 	}
 
-	if filter == nil || filter.Equals(iceberg.AlwaysTrue{}) {
+	if filter == nil {
+		return classifyAllDataFiles(s, fs, keepWholeFiles)
+	}
+	if filter.Equals(iceberg.AlwaysTrue{}) {
+		return classifyAllDataFiles(s, fs, keepWholeFiles)
+	}
+
+	return t.classifyFilesForFilteredDeletions(ctx, fs, filter, caseSensitive, concurrency, keepWholeFiles)
+}
+
+func classifyAllDataFiles(s *Snapshot, fs io.IO, keepWholeFiles bool) (filesToDelete, filesWithPartialDeletions []iceberg.DataFile, fileSeqByPath map[string]*int64, err error) {
+	if !keepWholeFiles {
 		for df, err := range s.dataFiles(fs, nil) {
 			if err != nil {
 				return nil, nil, nil, err
@@ -2735,7 +2743,23 @@ func (t *Transaction) classifyFilesForDeletions(ctx context.Context, fs io.IO, f
 		return filesToDelete, filesWithPartialDeletions, nil, nil
 	}
 
-	return t.classifyFilesForFilteredDeletions(ctx, fs, filter, caseSensitive, concurrency)
+	fileSeqByPath = make(map[string]*int64)
+	for entry, err := range s.entries(fs, iceberg.ManifestContentData, true) {
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		df := entry.DataFile()
+		if df.ContentType() != iceberg.EntryContentData {
+			continue
+		}
+		filesWithPartialDeletions = append(filesWithPartialDeletions, df)
+		if seq := entry.SequenceNum(); seq >= 0 {
+			seqCopy := seq
+			fileSeqByPath[df.FilePath()] = &seqCopy
+		}
+	}
+
+	return nil, filesWithPartialDeletions, fileSeqByPath, nil
 }
 
 type fileClassificationTask struct {
@@ -2767,7 +2791,7 @@ func (t *fileClassificationTask) buildPartitionProjection(specID int) (iceberg.B
 // classifyFilesForFilteredDeletions classifies files for filtered overwrite operations.
 // Returns files to delete completely, files to rewrite partially, the
 // per-file file_sequence_number map for rewrite candidates, and any error.
-func (t *Transaction) classifyFilesForFilteredDeletions(ctx context.Context, fs io.IO, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) (filesToDelete, filesWithPartialDeletes []iceberg.DataFile, fileSeqByPath map[string]*int64, err error) {
+func (t *Transaction) classifyFilesForFilteredDeletions(ctx context.Context, fs io.IO, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int, keepWholeFiles bool) (filesToDelete, filesWithPartialDeletes []iceberg.DataFile, fileSeqByPath map[string]*int64, err error) {
 	meta, err := t.txnMeta()
 	if err != nil {
 		return nil, nil, nil, err
@@ -2847,9 +2871,12 @@ func (t *Transaction) classifyFilesForFilteredDeletions(ctx context.Context, fs 
 					continue
 				}
 
-				strict, err := strictEvaluator(df)
-				if err != nil {
-					return fmt.Errorf("failed to evaluate data file %s with strict evaluator: %w", df.FilePath(), err)
+				strict := false
+				if !keepWholeFiles {
+					strict, err = strictEvaluator(df)
+					if err != nil {
+						return fmt.Errorf("failed to evaluate data file %s with strict evaluator: %w", df.FilePath(), err)
+					}
 				}
 
 				if strict {
@@ -2897,7 +2924,7 @@ func (t *Transaction) classifyFilesForFilteredDeletions(ctx context.Context, fs 
 // used to synthesize _last_updated_sequence_number when the source row's value is null. deletes maps
 // each file's path to its planned scan task, whose delete files are applied when the file is read. The
 // filter binding and substrait conversion are computed once here and reused across every file.
-func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, updater *snapshotProducer, files []iceberg.DataFile, fileSeqByPath map[string]*int64, deletes map[string]FileScanTask, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) error {
+func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, updater *snapshotProducer, files []iceberg.DataFile, fileSeqByPath map[string]*int64, deletes map[string]FileScanTask, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int, matcher *deleteRowMatcher) error {
 	meta, err := t.txnMeta()
 	if err != nil {
 		return err
@@ -2907,7 +2934,7 @@ func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, upda
 	// per-batch filter function is reused across every record batch from
 	// every file in this rewrite — substrait conversion in particular is
 	// non-trivial so doing it inside the iterator loop wastes work.
-	postFilter, err := preparePreserveBatchFilter(filter, meta.CurrentSchema(), caseSensitive, nil)
+	postFilter, err := preparePreserveBatchFilter(filter, meta.CurrentSchema(), caseSensitive, matcher)
 	if err != nil {
 		return err
 	}
@@ -2922,20 +2949,24 @@ func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, upda
 		// Use a separate UUID for rewrite operations to avoid filename collisions with new data files
 		rewriteUUID := uuid.New()
 		args := rewriteSingleFileArgs{
-			fs:            fs,
-			originalFile:  originalFile,
-			fileSeqNum:    fileSeqByPath[originalFile.FilePath()],
-			deletes:       deletes[originalFile.FilePath()],
-			postFilter:    postFilter,
-			caseSensitive: caseSensitive,
-			commitUUID:    rewriteUUID,
-			concurrency:   concurrency,
+			fs:              fs,
+			originalFile:    originalFile,
+			fileSeqNum:      fileSeqByPath[originalFile.FilePath()],
+			deletes:         deletes[originalFile.FilePath()],
+			postFilter:      postFilter,
+			skipIfUnchanged: matcher != nil,
+			caseSensitive:   caseSensitive,
+			commitUUID:      rewriteUUID,
+			concurrency:     concurrency,
 		}
-		rewrittenFiles, err := t.rewriteSingleFile(ctx, args)
+		rewrittenFiles, rewrote, err := t.rewriteSingleFile(ctx, args)
 		if err != nil {
 			_, removeErr := removeStagedPaths(wfs, writtenPaths)
 
 			return errors.Join(fmt.Errorf("failed to rewrite file %s: %w", originalFile.FilePath(), err), removeErr)
+		}
+		if !rewrote {
+			continue
 		}
 
 		updater.deleteDataFile(originalFile)
@@ -2971,19 +3002,20 @@ type rewriteSingleFileArgs struct {
 	// The scanner reads every row, unfiltered and unpruned, so a row the
 	// delete filter is null on is never dropped and _row_id positions stay
 	// correct.
-	postFilter    preserveBatchFunc
-	caseSensitive bool
-	commitUUID    uuid.UUID
-	concurrency   int
+	postFilter      preserveBatchFunc
+	skipIfUnchanged bool
+	caseSensitive   bool
+	commitUUID      uuid.UUID
+	concurrency     int
 }
 
 // rewriteSingleFile reads a single data file, applies the filter, and writes
 // new files with filtered data. See [rewriteSingleFileArgs] for parameter
 // semantics.
-func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleFileArgs) ([]iceberg.DataFile, error) {
+func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleFileArgs) ([]iceberg.DataFile, bool, error) {
 	meta, err := t.txnMeta()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	scanTask := &FileScanTask{
@@ -3004,7 +3036,10 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 	// pure CoW rewrite the surviving rows are unchanged, so they must keep
 	// their original value rather than inheriting the new commit's seq.
 	_, originalFirstRowID, _, _, _ := iceberginternal.BorrowedDataFilePointers(args.originalFile)
-	preserveRowLineage := meta.formatVersion >= 3 && originalFirstRowID != nil
+	preserveRowLineage := false
+	if meta.formatVersion >= 3 {
+		preserveRowLineage = originalFirstRowID != nil
+	}
 	projectedSchema := meta.CurrentSchema()
 	var factoryOpts []writerFactoryOption
 	if preserveRowLineage {
@@ -3021,7 +3056,7 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 
 	builtMeta, err := buildScanMetadata(meta)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build metadata: %w", err)
+		return nil, false, fmt.Errorf("failed to build metadata: %w", err)
 	}
 
 	scanner := &arrowScan{
@@ -3037,7 +3072,7 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 
 	arrowSchema, recordIter, err := scanner.GetRecords(ctx, []FileScanTask{*scanTask})
 	if err != nil {
-		return nil, fmt.Errorf("failed to get records from original file: %w", err)
+		return nil, false, fmt.Errorf("failed to get records from original file: %w", err)
 	}
 
 	// When preserving row lineage, use an Arrow schema with field IDs so that
@@ -3049,10 +3084,11 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 			TableProperties: builtMeta.Properties(),
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to build arrow schema with field IDs: %w", err)
+			return nil, false, fmt.Errorf("failed to build arrow schema with field IDs: %w", err)
 		}
 	}
 
+	var deletedRows int64
 	// Wrap the iterator to release records after consumption, keeping only
 	// the rows that survive the delete (after _row_id synthesis).
 	releaseIter := func(yield func(arrow.RecordBatch, error) bool) {
@@ -3063,12 +3099,14 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 				return
 			}
 
-			rec, _, err = args.postFilter(ctx, rec)
+			var deleted int64
+			rec, deleted, err = args.postFilter(ctx, rec)
 			if err != nil {
 				yield(nil, err)
 
 				return
 			}
+			deletedRows += deleted
 			if rec.NumRows() == 0 {
 				rec.Release()
 
@@ -3086,7 +3124,7 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 
 	wfs, err := requireWriteFileIO(args.fs)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	var result []iceberg.DataFile
@@ -3102,12 +3140,23 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 		if err != nil {
 			_, removeErr := removeDataFiles(wfs, result)
 
-			return nil, errors.Join(err, removeErr)
+			return nil, false, errors.Join(err, removeErr)
 		}
 		result = append(result, df)
 	}
 
-	return result, nil
+	if args.skipIfUnchanged {
+		if deletedRows == 0 {
+			_, removeErr := removeDataFiles(wfs, result)
+			if removeErr != nil {
+				return nil, false, removeErr
+			}
+
+			return nil, false, nil
+		}
+	}
+
+	return result, true, nil
 }
 
 // writePositionDeletesForFiles writes position-delete files for the rows in

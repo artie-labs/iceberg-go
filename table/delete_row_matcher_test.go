@@ -19,6 +19,7 @@ package table_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -102,12 +103,129 @@ func TestDeleteRowMatcher(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, []int64{1, 3, 4}, idsInTable(t, tbl))
 	})
-	t.Run("refuses copy-on-write", func(t *testing.T) {
-		tbl := newTable(t, "2")
+	t.Run("deletes matched rows on copy-on-write v1 and v2", func(t *testing.T) {
+		for _, version := range []string{"1", "2"} {
+			location := filepath.ToSlash(t.TempDir())
+			schema := iceberg.NewSchema(0,
+				iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+				iceberg.NestedField{ID: 2, Name: "data", Type: iceberg.PrimitiveTypes.String, Required: false},
+			)
+			props := iceberg.Properties{table.PropertyFormatVersion: version}
+			if version == "2" {
+				props[table.WriteDeleteModeKey] = table.WriteModeCopyOnWrite
+			}
+			meta, err := table.NewMetadata(schema, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, location, props)
+			require.NoError(t, err)
+			metaLoc := location + "/metadata/v1.metadata.json"
+			fsF := func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }
+			tbl := table.New(table.Identifier{"db", "cow_v" + version}, meta, metaLoc, fsF, &concurrentTestCatalog{metadata: meta, location: metaLoc, fsF: fsF})
+
+			data, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{
+				`[{"id":1,"data":"a"},{"id":2,"data":null},{"id":3,"data":"b"},{"id":4,"data":"b"},{"id":4,"data":"b"}]`,
+			})
+			require.NoError(t, err)
+			defer data.Release()
+			tbl, err = tbl.Append(ctx, array.NewTableReader(data, -1), nil)
+			require.NoError(t, err)
+
+			mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+			checkedCtx := compute.WithAllocator(ctx, mem)
+			// Filter matches all non-null rows strictly on id >= 1; matcher deletes only id 1 and duplicate id 4 rows.
+			matcher := func(mctx context.Context, batch arrow.RecordBatch) (*array.Boolean, error) {
+				ids := batch.Column(batch.Schema().FieldIndices("id")[0]).(*array.Int64)
+				bldr := array.NewBooleanBuilder(compute.GetAllocator(mctx))
+				defer bldr.Release()
+				for i := range int(batch.NumRows()) {
+					id := ids.Value(i)
+					if id == 1 {
+						bldr.Append(true)
+
+						continue
+					}
+					if id == 4 {
+						bldr.Append(true)
+
+						continue
+					}
+					bldr.Append(false)
+				}
+
+				return bldr.NewBooleanArray(), nil
+			}
+			tbl, err = tbl.Delete(checkedCtx, iceberg.GreaterThanEqual(iceberg.Reference("id"), int64(1)), nil,
+				table.WithDeleteRowMatcher([]string{"id", "data"}, matcher))
+			require.NoError(t, err)
+			assert.Equal(t, []int64{2, 3}, idsInTable(t, tbl))
+			mem.AssertSize(t, 0)
+
+			// A zero-match row-matcher delete leaves the snapshot unchanged and writes no new files.
+			snapBefore := tbl.CurrentSnapshot().SnapshotID
+			noMatch := func(mctx context.Context, batch arrow.RecordBatch) (*array.Boolean, error) {
+				bldr := array.NewBooleanBuilder(compute.GetAllocator(mctx))
+				defer bldr.Release()
+				for range int(batch.NumRows()) {
+					bldr.Append(false)
+				}
+
+				return bldr.NewBooleanArray(), nil
+			}
+			tbl, err = tbl.Delete(checkedCtx, iceberg.AlwaysTrue{}, nil, table.WithDeleteRowMatcher([]string{"id"}, noMatch))
+			require.NoError(t, err)
+			assert.Equal(t, snapBefore, tbl.CurrentSnapshot().SnapshotID)
+			assert.Equal(t, []int64{2, 3}, idsInTable(t, tbl))
+			mem.AssertSize(t, 0)
+		}
+	})
+	t.Run("copy-on-write matcher error cleans up rewritten files and leaks no Arrow memory", func(t *testing.T) {
+		location := filepath.ToSlash(t.TempDir())
+		schema := iceberg.NewSchema(0,
+			iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		)
+		meta, err := table.NewMetadata(schema, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, location, iceberg.Properties{
+			table.PropertyFormatVersion: "2",
+			table.WriteDeleteModeKey:    table.WriteModeCopyOnWrite,
+		})
+		require.NoError(t, err)
+		metaLoc := location + "/metadata/v1.metadata.json"
+		fsF := func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }
+		tbl := table.New(table.Identifier{"db", "cow_err"}, meta, metaLoc, fsF, &concurrentTestCatalog{metadata: meta, location: metaLoc, fsF: fsF})
+
+		idSchema := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false}}, nil)
+		for _, rowJSON := range []string{`[{"id":1},{"id":2}]`, `[{"id":3},{"id":4}]`} {
+			data, err := array.TableFromJSON(memory.DefaultAllocator, idSchema, []string{rowJSON})
+			require.NoError(t, err)
+			tbl, err = tbl.Append(ctx, array.NewTableReader(data, -1), nil)
+			data.Release()
+			require.NoError(t, err)
+		}
+
+		beforeParquet, err := filepath.Glob(filepath.Join(location, "data", "*.parquet"))
+		require.NoError(t, err)
+
+		mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+		checkedCtx := compute.WithAllocator(ctx, mem)
+		matcherErr := errors.New("matcher failed on second file")
+		matcher := func(mctx context.Context, batch arrow.RecordBatch) (*array.Boolean, error) {
+			ids := batch.Column(0).(*array.Int64)
+			bldr := array.NewBooleanBuilder(compute.GetAllocator(mctx))
+			defer bldr.Release()
+			for i := range int(batch.NumRows()) {
+				if ids.Value(i) == 4 {
+					return nil, matcherErr
+				}
+				bldr.Append(ids.Value(i) == 1)
+			}
+
+			return bldr.NewBooleanArray(), nil
+		}
 		txn := tbl.NewTransaction()
-		require.NoError(t, txn.SetProperties(iceberg.Properties{table.WriteDeleteModeKey: table.WriteModeCopyOnWrite}))
-		err := txn.Delete(ctx, superset, nil, table.WithDeleteRowMatcher([]string{"id", "data"}, pairs("1:a")))
-		assert.ErrorContains(t, err, "a delete row matcher needs write.delete.mode=merge-on-read")
+		err = txn.Delete(checkedCtx, iceberg.AlwaysTrue{}, nil, table.WithDeleteRowMatcher([]string{"id"}, matcher))
+		require.ErrorIs(t, err, matcherErr)
+		mem.AssertSize(t, 0)
+
+		afterParquet, err := filepath.Glob(filepath.Join(location, "data", "*.parquet"))
+		require.NoError(t, err)
+		assert.Equal(t, beforeParquet, afterParquet)
 	})
 	t.Run("rejects nil delete row matcher function", func(t *testing.T) {
 		tbl := newTable(t, "2")
@@ -213,6 +331,8 @@ func TestDeleteRowMatcher(t *testing.T) {
 			version string
 			mode    string
 		}{
+			{name: "v1_cow", version: "1", mode: table.WriteModeCopyOnWrite},
+			{name: "v2_cow", version: "2", mode: table.WriteModeCopyOnWrite},
 			{name: "v2_mor", version: "2", mode: table.WriteModeMergeOnRead},
 			{name: "v3_mor", version: "3", mode: table.WriteModeMergeOnRead},
 		} {
