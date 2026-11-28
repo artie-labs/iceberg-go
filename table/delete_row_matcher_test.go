@@ -19,6 +19,7 @@ package table_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -100,6 +101,30 @@ func TestDeleteRowMatcher(t *testing.T) {
 			table.WithDeleteRowMatcher([]string{"id", "data"}, pairs("2:a")))
 		require.NoError(t, err)
 		assert.Equal(t, []int64{1, 3, 4}, idsInTable(t, tbl))
+	})
+	t.Run("v3 merge-on-read skips already-deleted rows before calling matcher", func(t *testing.T) {
+		tbl := newTable(t, "3")
+		tbl, err := tbl.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), int64(1)), nil)
+		require.NoError(t, err)
+
+		// Fail if the matcher ever sees the already-deleted id=1 row.
+		boom := errors.New("saw already-deleted row")
+		matcher := func(_ context.Context, batch arrow.RecordBatch) (*array.Boolean, error) {
+			ids := batch.Column(batch.Schema().FieldIndices("id")[0]).(*array.Int64)
+			bldr := array.NewBooleanBuilder(memory.DefaultAllocator)
+			defer bldr.Release()
+			for i := range int(batch.NumRows()) {
+				if ids.Value(i) == 1 {
+					return nil, boom
+				}
+				bldr.Append(ids.Value(i) == 3)
+			}
+
+			return bldr.NewBooleanArray(), nil
+		}
+		tbl, err = tbl.Delete(ctx, iceberg.AlwaysTrue{}, nil, table.WithDeleteRowMatcher([]string{"id"}, matcher))
+		require.NoError(t, err)
+		assert.Equal(t, []int64{2, 4}, idsInTable(t, tbl))
 	})
 	t.Run("refuses copy-on-write", func(t *testing.T) {
 		tbl := newTable(t, "2")

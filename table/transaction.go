@@ -3124,7 +3124,7 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 		scanDeletes = nil
 	}
 
-	posDeleteRecIter, err := t.makePositionDeleteRecordsForFilter(ctx, fs, files, scanDeletes, filter, caseSensitive, concurrency, matcher)
+	posDeleteRecIter, err := t.makePositionDeleteRecordsForFilter(ctx, fs, files, scanDeletes, existingDVBitmaps, filter, caseSensitive, concurrency, matcher)
 	if err != nil {
 		return nil, err
 	}
@@ -3313,7 +3313,7 @@ func (t *Transaction) plannedDeletesForFilter(ctx context.Context, meta *Metadat
 	return tasks, nil
 }
 
-func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs io.IO, files []iceberg.DataFile, existingDeletes map[string][]iceberg.DataFile, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int, matcher *deleteRowMatcher) (seq2 iter.Seq2[arrow.RecordBatch, error], err error) {
+func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs io.IO, files []iceberg.DataFile, existingDeletes map[string][]iceberg.DataFile, existingDVBitmaps map[string]*dv.RoaringPositionBitmap, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int, matcher *deleteRowMatcher) (seq2 iter.Seq2[arrow.RecordBatch, error], err error) {
 	meta, err := t.txnMeta()
 	if err != nil {
 		return nil, err
@@ -3366,15 +3366,16 @@ func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs
 	}
 
 	scanner := &arrowScan{
-		metadata:        builtMeta,
-		fs:              fs,
-		scanSchema:      meta.CurrentSchema(),
-		projectedSchema: projected,
-		boundRowFilter:  boundFilter,
-		caseSensitive:   caseSensitive,
-		rowLimit:        -1, // No limit
-		concurrency:     concurrency,
-		deleteMatcher:   matcher,
+		metadata:              builtMeta,
+		fs:                    fs,
+		scanSchema:            meta.CurrentSchema(),
+		projectedSchema:       projected,
+		boundRowFilter:        boundFilter,
+		caseSensitive:         caseSensitive,
+		rowLimit:              -1, // No limit
+		concurrency:           concurrency,
+		deleteMatcher:         matcher,
+		existingDeleteBitmaps: existingDVBitmaps,
 	}
 	invariants, err := scanner.scanInvariants(builtMeta.Properties())
 	if err != nil {
