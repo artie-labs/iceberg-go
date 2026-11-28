@@ -839,6 +839,22 @@ func (sp *snapshotProducer) deleteFileRemoved(df iceberg.DataFile) bool {
 	return false
 }
 
+func (sp *snapshotProducer) hasChanges() bool {
+	if len(sp.addedFiles) > 0 {
+		return true
+	}
+	if len(sp.addedDeleteFiles) > 0 {
+		return true
+	}
+	if len(sp.deletedFiles) > 0 {
+		return true
+	}
+	if len(sp.deletedDeleteFiles) > 0 {
+		return true
+	}
+	return len(sp.deletedDVsByRef) > 0
+}
+
 func (sp *snapshotProducer) newManifestWriter(spec iceberg.PartitionSpec, opts ...iceberg.ManifestWriterOption) (_ *iceberg.ManifestWriter, _ string, _ *internal.CountingWriter, _ io.Closer, err error) {
 	out, path, err := sp.newManifestOutput()
 	if err != nil {

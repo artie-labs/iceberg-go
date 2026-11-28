@@ -23,9 +23,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	iofs "io/fs"
 	"iter"
 	"log/slog"
 	"maps"
+	"os"
 	"runtime"
 	"slices"
 	"strconv"
@@ -2451,16 +2453,8 @@ func (t *Transaction) performCopyOnWriteDeletion(ctx context.Context, operation 
 		return nil, nil, err
 	}
 
-	if meta.NameMapping() == nil {
-		nameMapping := meta.CurrentSchema().NameMapping()
-		mappingJson, err := json.Marshal(nameMapping)
-		if err != nil {
-			return nil, nil, err
-		}
-		err = t.SetProperties(iceberg.Properties{DefaultNameMappingKey: string(mappingJson)})
-		if err != nil {
-			return nil, nil, err
-		}
+	if err := t.ensureNameMapping(); err != nil {
+		return nil, nil, err
 	}
 
 	commitUUID := uuid.New()
@@ -2496,6 +2490,9 @@ func (t *Transaction) performMergeOnReadDeletion(ctx context.Context, snapshotPr
 	if err != nil {
 		return nil, err
 	}
+	if err := validateDeleteRowMatcherColumns(meta.CurrentSchema(), matcher, caseSensitive); err != nil {
+		return nil, err
+	}
 	fs, err := t.tbl.fsF(ctx)
 	if err != nil {
 		return nil, err
@@ -2505,14 +2502,8 @@ func (t *Transaction) performMergeOnReadDeletion(ctx context.Context, snapshotPr
 		return nil, err
 	}
 
-	if meta.NameMapping() == nil {
-		nameMapping := meta.CurrentSchema().NameMapping()
-		mappingJson, err := json.Marshal(nameMapping)
-		if err != nil {
-			return nil, err
-		}
-		err = t.SetProperties(iceberg.Properties{DefaultNameMappingKey: string(mappingJson)})
-		if err != nil {
+	if matcher == nil {
+		if err := t.ensureNameMapping(); err != nil {
 			return nil, err
 		}
 	}
@@ -2556,6 +2547,44 @@ func (t *Transaction) performMergeOnReadDeletion(ctx context.Context, snapshotPr
 	}
 
 	return updater, nil
+}
+
+func validateDeleteRowMatcherColumns(schema *iceberg.Schema, matcher *deleteRowMatcher, caseSensitive bool) error {
+	if matcher == nil {
+		return nil
+	}
+	if matcher.match == nil {
+		return errors.New("delete row matcher function is required")
+	}
+	for _, name := range matcher.columns {
+		_, ok := schema.FindFieldByNameCaseInsensitive(name)
+		if caseSensitive {
+			_, ok = schema.FindFieldByName(name)
+		}
+		if !ok {
+			return fmt.Errorf("delete row matcher column %q is not in the table schema", name)
+		}
+	}
+
+	return nil
+}
+
+// buildScanMetadata builds immutable metadata for an internal scan, populating a fallback default name mapping
+// without mutating the transaction when the table does not yet persist one.
+func buildScanMetadata(meta *MetadataBuilder) (Metadata, error) {
+	if meta.NameMapping() != nil {
+		return meta.Build()
+	}
+	cloned := meta.clone()
+	mappingJSON, err := json.Marshal(cloned.CurrentSchema().NameMapping())
+	if err != nil {
+		return nil, err
+	}
+	if err := NewSetPropertiesUpdate(iceberg.Properties{DefaultNameMappingKey: string(mappingJSON)}).Apply(cloned); err != nil {
+		return nil, err
+	}
+
+	return cloned.Build()
 }
 
 type DeleteOption func(deleteOp *deleteOperation)
@@ -2659,6 +2688,15 @@ func (t *Transaction) Delete(ctx context.Context, filter iceberg.BooleanExpressi
 		}
 	default:
 		return fmt.Errorf("unsupported write mode: '%s'", writeDeleteMode)
+	}
+
+	if deleteOp.rowMatcher != nil {
+		if !updater.hasChanges() {
+			return nil
+		}
+		if err := t.ensureNameMapping(); err != nil {
+			return err
+		}
 	}
 
 	updates, reqs, err := updater.commit(ctx)
@@ -2874,6 +2912,12 @@ func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, upda
 		return err
 	}
 
+	wfs, err := requireWriteFileIO(fs)
+	if err != nil {
+		return err
+	}
+
+	var writtenPaths []string
 	for _, originalFile := range files {
 		// Use a separate UUID for rewrite operations to avoid filename collisions with new data files
 		rewriteUUID := uuid.New()
@@ -2889,11 +2933,15 @@ func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, upda
 		}
 		rewrittenFiles, err := t.rewriteSingleFile(ctx, args)
 		if err != nil {
-			return fmt.Errorf("failed to rewrite file %s: %w", originalFile.FilePath(), err)
+			_, removeErr := removeStagedPaths(wfs, writtenPaths)
+
+			return errors.Join(fmt.Errorf("failed to rewrite file %s: %w", originalFile.FilePath(), err), removeErr)
 		}
 
 		updater.deleteDataFile(originalFile)
 		for _, rewrittenFile := range rewrittenFiles {
+			path := rewrittenFile.FilePath()
+			writtenPaths = append(writtenPaths, path)
 			updater.appendDataFile(rewrittenFile)
 		}
 	}
@@ -2971,7 +3019,7 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 		scanTask.DataSequenceNumber = args.fileSeqNum
 	}
 
-	builtMeta, err := meta.Build()
+	builtMeta, err := buildScanMetadata(meta)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build metadata: %w", err)
 	}
@@ -3052,7 +3100,9 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 
 	for df, err := range itr {
 		if err != nil {
-			return nil, err
+			_, removeErr := removeDataFiles(wfs, result)
+
+			return nil, errors.Join(err, removeErr)
 		}
 		result = append(result, df)
 	}
@@ -3131,6 +3181,21 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 	if err != nil {
 		return nil, err
 	}
+	releasePosDeleteRecIter := func(yield func(arrow.RecordBatch, error) bool) {
+		for rec, err := range posDeleteRecIter {
+			if err != nil {
+				yield(nil, err)
+
+				return
+			}
+			if !yield(rec, nil) {
+				rec.Release()
+
+				return
+			}
+			rec.Release()
+		}
+	}
 
 	partitionContextByFilePath := make(map[string]partitionContext, len(files))
 	for _, df := range files {
@@ -3139,23 +3204,30 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 
 	posDeleteFiles := positionDeleteRecordsToDataFiles(ctx, t.tbl.Location(), meta, partitionContextByFilePath, recordWritingArgs{
 		sc:          PositionalDeleteArrowSchema,
-		itr:         posDeleteRecIter,
+		itr:         releasePosDeleteRecIter,
 		writeUUID:   &commitUUID,
 		fs:          wfs,
 		existingDVs: existingDVBitmaps,
 	})
 
 	var referenced []string
+	var writtenPaths []string
 	seen := make(map[string]struct{})
 	for f, err := range posDeleteFiles {
 		if err != nil {
-			return nil, err
+			_, removeErr := removeStagedPaths(wfs, writtenPaths)
+
+			return nil, errors.Join(err, removeErr)
 		}
+		path := f.FilePath()
+		writtenPaths = append(writtenPaths, path)
 		updater.appendDeleteFile(f)
-		if ref := iceberginternal.BorrowedDataFileReferencedDataFile(f); ref != nil && *ref != "" {
-			if _, ok := seen[*ref]; !ok {
-				seen[*ref] = struct{}{}
-				referenced = append(referenced, *ref)
+		if ref := iceberginternal.BorrowedDataFileReferencedDataFile(f); ref != nil {
+			if *ref != "" {
+				if _, ok := seen[*ref]; !ok {
+					seen[*ref] = struct{}{}
+					referenced = append(referenced, *ref)
+				}
 			}
 		}
 	}
@@ -3337,7 +3409,7 @@ func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs
 		return nil, fmt.Errorf("failed to bind filter: %w", err)
 	}
 
-	builtMeta, err := meta.Build()
+	builtMeta, err := buildScanMetadata(meta)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build metadata: %w", err)
 	}
@@ -3569,6 +3641,44 @@ func (t *Transaction) Commit(ctx context.Context) (*Table, error) {
 	t.committed = true
 
 	return t.tbl, nil
+}
+
+func removeDataFiles(wfs io.WriteFileIO, files []iceberg.DataFile) ([]string, error) {
+	paths := make([]string, len(files))
+	for i, df := range files {
+		paths[i] = df.FilePath()
+	}
+
+	return removeStagedPaths(wfs, paths)
+}
+
+func removeStagedPaths(wfs io.WriteFileIO, paths []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(paths))
+	var remaining []string
+	var removeErr error
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		if _, dup := seen[path]; dup {
+			continue
+		}
+		seen[path] = struct{}{}
+		err := wfs.Remove(path)
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, iofs.ErrNotExist) {
+			continue
+		}
+		if os.IsNotExist(err) {
+			continue
+		}
+		remaining = append(remaining, path)
+		removeErr = errors.Join(removeErr, fmt.Errorf("remove staged file %s: %w", path, err))
+	}
+
+	return remaining, removeErr
 }
 
 func validateGCEnabledForSnapshotExpiration(props iceberg.Properties) error {
