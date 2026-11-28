@@ -80,8 +80,13 @@ func TestRefTypes(t *testing.T) {
 			_, converted, err := substrait.ConvertExpr(sc, ref, true)
 			require.NoError(t, err)
 
-			assert.Equal(t, fmt.Sprintf("is_null(.field(%d) => %s) => boolean", idx,
-				tt.exp.WithNullability(types.NullabilityNullable)), converted.String())
+			field := fmt.Sprintf(".field(%d) => %s", idx, tt.exp.WithNullability(types.NullabilityNullable))
+			want := fmt.Sprintf("is_null(%s) => boolean", field)
+			if _, ok := tt.exp.(*types.DecimalType); ok {
+				// arrow-go v18.8's is_null panics on a decimal, so it tests equal(column, column) instead.
+				want = fmt.Sprintf("is_null(equal(%s, %s) => boolean?) => boolean", field, field)
+			}
+			assert.Equal(t, want, converted.String())
 		})
 	}
 }
@@ -162,8 +167,8 @@ func TestExprs(t *testing.T) {
 	}{
 		{iceberg.IsNull(ref), tableSchemaSimple, "is_null(.field(0) => string?) => boolean"},
 		{iceberg.NotNull(ref), tableSchemaSimple, "is_not_null(.field(0) => string?) => boolean"},
-		{iceberg.IsNaN(ref), doubleSchema, "is_nan(.field(0) => fp64?) => boolean?"},
-		{iceberg.NotNaN(ref), doubleSchema, "not(is_nan(.field(0) => fp64?) => boolean?) => boolean?"},
+		{iceberg.IsNaN(ref), doubleSchema, "and(is_not_null(.field(0) => fp64?) => boolean, is_nan(.field(0) => fp64?) => boolean?) => boolean?"},
+		{iceberg.NotNaN(ref), doubleSchema, "or(is_null(.field(0) => fp64?) => boolean, not(is_nan(.field(0) => fp64?) => boolean?) => boolean?) => boolean?"},
 		{iceberg.EqualTo(ref, "hello"), tableSchemaSimple, "equal(.field(0) => string?, string(hello)) => boolean?"},
 		{iceberg.NotEqualTo(ref, "hello"), tableSchemaSimple, "not_equal(.field(0) => string?, string(hello)) => boolean?"},
 		{iceberg.GreaterThanEqual(ref, "hello"), tableSchemaSimple, "gte(.field(0) => string?, string(hello)) => boolean?"},
