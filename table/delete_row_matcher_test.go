@@ -108,6 +108,11 @@ func TestDeleteRowMatcher(t *testing.T) {
 		err := txn.Delete(ctx, superset, nil, table.WithDeleteRowMatcher([]string{"id", "data"}, pairs("1:a")))
 		assert.ErrorContains(t, err, "a delete row matcher needs write.delete.mode=merge-on-read")
 	})
+	t.Run("rejects nil delete row matcher function", func(t *testing.T) {
+		tbl := newTable(t, "2")
+		_, err := tbl.Delete(ctx, superset, nil, table.WithDeleteRowMatcher([]string{"id"}, nil))
+		assert.ErrorContains(t, err, "delete row matcher function is required")
+	})
 	t.Run("sees a renamed key column under its new name", func(t *testing.T) {
 		tbl := newTable(t, "2")
 		txn := tbl.NewTransaction()
