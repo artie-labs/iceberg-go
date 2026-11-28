@@ -105,6 +105,9 @@ func isFloatingPointType(typ iceberg.Type) bool {
 //	rd.AddDeletes(deleteFiles...)
 //	err = rd.Commit(ctx)
 func (t *Transaction) WriteEqualityDeletes(ctx context.Context, equalityFieldIDs []int, records iter.Seq2[arrow.RecordBatch, error]) ([]iceberg.DataFile, error) {
+	if err := t.checkActive(); err != nil {
+		return nil, err
+	}
 	meta, err := t.txnMeta()
 	if err != nil {
 		return nil, err
@@ -161,7 +164,7 @@ func (t *Transaction) WriteEqualityDeletes(ctx context.Context, equalityFieldIDs
 		if err != nil {
 			return nil, err
 		}
-
+		t.recordStagedFile(df.FilePath())
 		result = append(result, df)
 	}
 

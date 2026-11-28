@@ -1991,6 +1991,8 @@ func binPackRecords(itr iter.Seq2[arrow.RecordBatch, error], recordLookback int,
 
 			rec.Retain()
 			if !yield(rec) {
+				rec.Release()
+
 				return
 			}
 		}
@@ -2276,6 +2278,10 @@ func positionDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 					Batches:     batch,
 				}
 				if !yield(t) {
+					for _, b := range t.Batches {
+						b.Release()
+					}
+
 					return
 				}
 			}
@@ -2312,8 +2318,9 @@ func positionDeleteRecordsToDataFilesDV(ctx context.Context, rootLocation string
 
 		// args.existingDVs holds, per data file, every position already deleted:
 		// its current DV and any legacy Parquet position deletes from before a
-		// v2 to v3 upgrade. The scan that produced args.itr applies neither, so
-		// it re-reports those positions. A file's seed is loaded into the
+		// v2 to v3 upgrade. The scan skips positions already present in args.existingDVs
+		// before running delete filters or matchers, and the check below still guards
+		// any direct caller that feeds pre-deleted positions. A file's seed is loaded into the
 		// writer on its first position not already in the seed, so the merged
 		// DV keeps the earlier deletes (dropping them would resurrect those
 		// rows), and a file with nothing new gets no DV: the caller then keeps

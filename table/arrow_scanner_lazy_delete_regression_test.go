@@ -621,7 +621,7 @@ func TestMergeOnReadDeleteScanStartsOnlyWhenRead(t *testing.T) {
 
 	// value 1 is position 1, already deleted; value 2 is position 2.
 	filter := iceberg.IsIn(iceberg.Reference("value"), int64(1), int64(2))
-	records, err := txn.makePositionDeleteRecordsForFilter(ctx, memFS, []iceberg.DataFile{dataFile}, existing, filter, true, 2, nil)
+	records, err := txn.makePositionDeleteRecordsForFilter(ctx, memFS, []iceberg.DataFile{dataFile}, existing, nil, filter, true, 2, nil)
 	require.NoError(t, err)
 	assert.Zero(t, memFS.opens.Load(), "building the scan must not read any file")
 

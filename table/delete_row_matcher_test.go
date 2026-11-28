@@ -19,14 +19,17 @@ package table_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
@@ -104,6 +107,30 @@ func TestDeleteRowMatcher(t *testing.T) {
 			table.WithDeleteRowMatcher([]string{"id", "data"}, pairs("2:a")))
 		require.NoError(t, err)
 		assert.Equal(t, []int64{1, 3, 4}, idsInTable(t, tbl))
+	})
+	t.Run("v3 merge-on-read skips already-deleted rows before calling matcher", func(t *testing.T) {
+		tbl := newTable(t, "3")
+		tbl, err := tbl.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), int64(1)), nil)
+		require.NoError(t, err)
+
+		// Fail if the matcher ever sees the already-deleted id=1 row.
+		boom := errors.New("saw already-deleted row")
+		matcher := func(_ context.Context, batch arrow.RecordBatch) (*array.Boolean, error) {
+			ids := batch.Column(batch.Schema().FieldIndices("id")[0]).(*array.Int64)
+			bldr := array.NewBooleanBuilder(memory.DefaultAllocator)
+			defer bldr.Release()
+			for i := range int(batch.NumRows()) {
+				if ids.Value(i) == 1 {
+					return nil, boom
+				}
+				bldr.Append(ids.Value(i) == 3)
+			}
+
+			return bldr.NewBooleanArray(), nil
+		}
+		tbl, err = tbl.Delete(ctx, iceberg.AlwaysTrue{}, nil, table.WithDeleteRowMatcher([]string{"id"}, matcher))
+		require.NoError(t, err)
+		assert.Equal(t, []int64{2, 4}, idsInTable(t, tbl))
 	})
 	t.Run("refuses copy-on-write", func(t *testing.T) {
 		tbl := newTable(t, "2")
@@ -279,4 +306,296 @@ func TestDeleteRowMatcher(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, []int64{1, 3}, idsInTable(t, tbl))
 	})
+	t.Run("releases arrow memory across delete modes", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			version string
+			mode    string
+		}{
+			{name: "v2_mor", version: "2", mode: table.WriteModeMergeOnRead},
+			{name: "v3_mor", version: "3", mode: table.WriteModeMergeOnRead},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				tbl := newDeleteModeTestTable(t, tc.mode, tc.version)
+				data, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{
+					`[{"id":1,"data":"a"},{"id":2,"data":"a"},{"id":3,"data":"b"},{"id":4,"data":"b"}]`,
+				})
+				require.NoError(t, err)
+				defer data.Release()
+
+				tbl, err = tbl.Append(ctx, array.NewTableReader(data, -1), nil)
+				require.NoError(t, err)
+
+				alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+				deleteCtx := compute.WithAllocator(ctx, alloc)
+				matcher := func(callCtx context.Context, batch arrow.RecordBatch) (*array.Boolean, error) {
+					ids := batch.Column(batch.Schema().FieldIndices("id")[0]).(*array.Int64)
+					bldr := array.NewBooleanBuilder(compute.GetAllocator(callCtx))
+					defer bldr.Release()
+					for i := range int(batch.NumRows()) {
+						bldr.Append(ids.Value(i)%2 == 0)
+					}
+
+					return bldr.NewBooleanArray(), nil
+				}
+
+				tbl, err = tbl.Delete(deleteCtx, iceberg.AlwaysTrue{}, nil,
+					table.WithDeleteRowMatcher([]string{"id"}, matcher))
+				require.NoError(t, err)
+				alloc.AssertSize(t, 0)
+				assert.Equal(t, []int64{1, 3}, idsInTable(t, tbl))
+			})
+		}
+	})
+
+	t.Run("CleanupStagedFiles removes uncommitted and conflicted files but preserves uncertain or committed files", func(t *testing.T) {
+		tbl := newTable(t, "2")
+		location := strings.TrimPrefix(tbl.Location(), "file://")
+		listDataFiles := func() []string {
+			matches, err := filepath.Glob(filepath.Join(location, "data", "*"))
+			require.NoError(t, err)
+
+			return matches
+		}
+		listAvroFiles := func() []string {
+			matches, err := filepath.Glob(filepath.Join(location, "metadata", "*.avro"))
+			require.NoError(t, err)
+
+			return matches
+		}
+		beforeData := listDataFiles()
+		beforeAvro := listAvroFiles()
+
+		{
+			// Pre-commit abort cleans up staged delete files, manifests, and manifest lists.
+			txn := tbl.NewTransaction()
+			require.NoError(t, txn.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), int64(1)), nil))
+			assert.Greater(t, len(listDataFiles()), len(beforeData))
+			assert.Greater(t, len(listAvroFiles()), len(beforeAvro))
+			require.NoError(t, txn.CleanupStagedFiles(ctx))
+			assert.Equal(t, beforeData, listDataFiles())
+			assert.Equal(t, beforeAvro, listAvroFiles())
+
+			// Aborted transaction rejects further mutations and TableCommit without writing files.
+			_, tcErr := txn.TableCommit()
+			assert.ErrorContains(t, tcErr, "aborted")
+			assert.ErrorContains(t, txn.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), int64(2)), nil), "aborted")
+			data, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{`[{"id":5,"data":"c"}]`})
+			require.NoError(t, err)
+			defer data.Release()
+			assert.ErrorContains(t, txn.Append(ctx, array.NewTableReader(data, -1), nil), "aborted")
+			assert.ErrorContains(t, txn.Overwrite(ctx, array.NewTableReader(data, -1), nil), "aborted")
+			assert.Equal(t, beforeData, listDataFiles())
+			assert.Equal(t, beforeAvro, listAvroFiles())
+		}
+
+		{
+			// WriteEqualityDeletes staged files are tracked and removed on abort.
+			eqSchema := arrow.NewSchema([]arrow.Field{
+				{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+			}, nil)
+			eqTbl, err := array.TableFromJSON(memory.DefaultAllocator, eqSchema, []string{`[{"id":1}]`})
+			require.NoError(t, err)
+			defer eqTbl.Release()
+
+			txn := tbl.NewTransaction()
+			eqFiles, err := txn.WriteEqualityDeletes(ctx, []int{1}, array.IterFromReader(array.NewTableReader(eqTbl, -1)))
+			require.NoError(t, err)
+			require.NotEmpty(t, eqFiles)
+			assert.Greater(t, len(listDataFiles()), len(beforeData))
+			require.NoError(t, txn.CleanupStagedFiles(ctx))
+			assert.Equal(t, beforeData, listDataFiles())
+			_, err = txn.WriteEqualityDeletes(ctx, []int{1}, array.IterFromReader(array.NewTableReader(eqTbl, -1)))
+			assert.ErrorContains(t, err, "aborted")
+			assert.Equal(t, beforeData, listDataFiles())
+		}
+
+		{
+			// Definite conflict (ErrCommitFailed) removes staged files, manifests, and manifest lists.
+			conflictCat := &fixedCommitErrCatalog{err: table.ErrCommitFailed}
+			conflictTbl := table.New(tbl.Identifier(), tbl.Metadata(), tbl.MetadataLocation(), tbl.FS, conflictCat)
+			conflictTxn := conflictTbl.NewTransaction()
+			require.NoError(t, conflictTxn.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), int64(2)), nil))
+			assert.Greater(t, len(listDataFiles()), len(beforeData))
+			assert.Greater(t, len(listAvroFiles()), len(beforeAvro))
+			_, err := conflictTxn.Commit(ctx)
+			require.ErrorIs(t, err, table.ErrCommitFailed)
+			require.NoError(t, conflictTxn.CleanupStagedFiles(ctx))
+			assert.Equal(t, beforeData, listDataFiles())
+			assert.Equal(t, beforeAvro, listAvroFiles())
+		}
+
+		var preservedData, preservedAvro []string
+		{
+			// Uncertain commit error (non-ErrCommitFailed) marks transaction committed so CleanupStagedFiles preserves all staged files.
+			uncertainErr := errors.New("connection reset after write")
+			uncertainCat := &fixedCommitErrCatalog{err: uncertainErr}
+			uncertainTbl := table.New(tbl.Identifier(), tbl.Metadata(), tbl.MetadataLocation(), tbl.FS, uncertainCat)
+			uncertainTxn := uncertainTbl.NewTransaction()
+			require.NoError(t, uncertainTxn.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), int64(3)), nil))
+			preservedData = listDataFiles()
+			preservedAvro = listAvroFiles()
+			assert.Greater(t, len(preservedData), len(beforeData))
+			assert.Greater(t, len(preservedAvro), len(beforeAvro))
+			_, err := uncertainTxn.Commit(ctx)
+			require.ErrorIs(t, err, uncertainErr)
+			require.NoError(t, uncertainTxn.CleanupStagedFiles(ctx))
+			assert.Equal(t, preservedData, listDataFiles())
+			assert.Equal(t, preservedAvro, listAvroFiles())
+			for _, path := range append(preservedData, preservedAvro...) {
+				_, statErr := os.Stat(path)
+				require.NoError(t, statErr)
+			}
+		}
+
+		{
+			// Real OCC retry that hits ErrCommitDiverged cleans up staged files (with retryable cleanup on cancelled ctx) and blocks TableCommit.
+			retryLocation := filepath.ToSlash(t.TempDir())
+			retrySchema := iceberg.NewSchema(0,
+				iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+				iceberg.NestedField{ID: 2, Name: "data", Type: iceberg.PrimitiveTypes.String, Required: false},
+			)
+			retryMeta, err := table.NewMetadata(retrySchema, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, retryLocation, iceberg.Properties{
+				table.PropertyFormatVersion: "2",
+				table.WriteDeleteModeKey:    table.WriteModeCopyOnWrite,
+				table.CommitNumRetriesKey:   "2",
+			})
+			require.NoError(t, err)
+			retryMetaLoc := retryLocation + "/metadata/v1.metadata.json"
+			ctxErr := errors.New("canceled fs lookup")
+			fsF := func(c context.Context) (iceio.IO, error) {
+				if c.Err() != nil {
+					return nil, ctxErr
+				}
+
+				return iceio.LocalFS{}, nil
+			}
+			cat := &concurrentTestCatalog{metadata: retryMeta, location: retryMetaLoc, fsF: fsF}
+			retryTbl := table.New(table.Identifier{"db", "diverged"}, retryMeta, retryMetaLoc, fsF, cat)
+
+			initData, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{
+				`[{"id":1,"data":"a"},{"id":2,"data":"a"}]`,
+			})
+			require.NoError(t, err)
+			defer initData.Release()
+			retryTbl, err = retryTbl.Append(ctx, array.NewTableReader(initData, -1), nil)
+			require.NoError(t, err)
+
+			// Stage a delete on the current snapshot, then concurrently drop the data file so OCC retry hits real ErrCommitDiverged.
+			retryTxn := retryTbl.NewTransaction()
+			require.NoError(t, retryTxn.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), int64(1)), nil))
+			_, err = retryTbl.Delete(ctx, iceberg.AlwaysTrue{}, nil)
+			require.NoError(t, err)
+
+			listRetryFiles := func() []string {
+				dataMatches, gErr := filepath.Glob(filepath.Join(retryLocation, "data", "*"))
+				require.NoError(t, gErr)
+				avroMatches, gErr := filepath.Glob(filepath.Join(retryLocation, "metadata", "*.avro"))
+				require.NoError(t, gErr)
+
+				return append(dataMatches, avroMatches...)
+			}
+			beforeCleanup := listRetryFiles()
+			_, err = retryTxn.Commit(ctx)
+			require.ErrorIs(t, err, table.ErrCommitDiverged)
+			_, tcErr := retryTxn.TableCommit()
+			assert.ErrorContains(t, tcErr, "aborted")
+
+			canceledCtx, cancel := context.WithCancel(ctx)
+			cancel()
+			require.ErrorIs(t, retryTxn.CleanupStagedFiles(canceledCtx), ctxErr)
+			assert.Equal(t, beforeCleanup, listRetryFiles())
+			require.NoError(t, retryTxn.CleanupStagedFiles(ctx))
+			assert.Less(t, len(listRetryFiles()), len(beforeCleanup))
+			_, err = retryTxn.Commit(ctx)
+			assert.ErrorContains(t, err, "aborted")
+		}
+
+		{
+			// OCC retry rebuilds the manifest list on attempt 1; CleanupStagedFiles removes data, manifest, attempt-0 list, and rebuilt attempt-1 list.
+			occLocation := filepath.ToSlash(t.TempDir())
+			occSchema := iceberg.NewSchema(0,
+				iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+				iceberg.NestedField{ID: 2, Name: "data", Type: iceberg.PrimitiveTypes.String, Required: false},
+			)
+			occMeta, err := table.NewMetadata(occSchema, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, occLocation, iceberg.Properties{
+				table.PropertyFormatVersion: "2",
+				table.CommitNumRetriesKey:   "1",
+			})
+			require.NoError(t, err)
+			occMetaLoc := occLocation + "/metadata/v1.metadata.json"
+			fsF := func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }
+			baseCat := &concurrentTestCatalog{metadata: occMeta, location: occMetaLoc, fsF: fsF}
+			occTbl := table.New(table.Identifier{"db", "occ_rebuilt"}, occMeta, occMetaLoc, fsF, baseCat)
+
+			batch1, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{`[{"id":1,"data":"a"}]`})
+			require.NoError(t, err)
+			defer batch1.Release()
+			occTbl, err = occTbl.Append(ctx, array.NewTableReader(batch1, -1), nil)
+			require.NoError(t, err)
+
+			// Stage an append on a catalog that always returns ErrCommitFailed on CommitTable but loads the latest table on LoadTable.
+			failingCat := &alwaysConflictCatalog{loader: baseCat}
+			conflictTbl := table.New(occTbl.Identifier(), occTbl.Metadata(), occTbl.MetadataLocation(), fsF, failingCat)
+			batch2, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{`[{"id":2,"data":"b"}]`})
+			require.NoError(t, err)
+			defer batch2.Release()
+			occTxn := conflictTbl.NewTransaction()
+			require.NoError(t, occTxn.Append(ctx, array.NewTableReader(batch2, -1), nil))
+
+			// Advance the catalog head concurrently so attempt 1 rebuilds the manifest list against the new parent.
+			batch3, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{`[{"id":3,"data":"c"}]`})
+			require.NoError(t, err)
+			defer batch3.Release()
+			_, err = occTbl.Append(ctx, array.NewTableReader(batch3, -1), nil)
+			require.NoError(t, err)
+
+			listOccData := func() []string {
+				m, gErr := filepath.Glob(filepath.Join(occLocation, "data", "*"))
+				require.NoError(t, gErr)
+
+				return m
+			}
+			listOccAvro := func() []string {
+				m, gErr := filepath.Glob(filepath.Join(occLocation, "metadata", "*.avro"))
+				require.NoError(t, gErr)
+
+				return m
+			}
+			avroBeforeRetry := listOccAvro()
+			_, err = occTxn.Commit(ctx)
+			require.ErrorIs(t, err, table.ErrCommitFailed)
+			avroAfterRetry := listOccAvro()
+			assert.NotEqual(t, avroBeforeRetry, avroAfterRetry, "retry must have written a rebuilt manifest list")
+
+			dataBeforeCleanup := len(listOccData())
+			require.NoError(t, occTxn.CleanupStagedFiles(ctx))
+			assert.Equal(t, dataBeforeCleanup-1, len(listOccData()))
+			assert.Len(t, listOccAvro(), 4, "manifest, attempt-0 manifest list, and attempt-1 rebuilt manifest list must all be removed")
+		}
+	})
+}
+
+type fixedCommitErrCatalog struct {
+	err error
+}
+
+func (c *fixedCommitErrCatalog) LoadTable(context.Context, table.Identifier) (*table.Table, error) {
+	return nil, errors.New("unexpected LoadTable")
+}
+
+func (c *fixedCommitErrCatalog) CommitTable(context.Context, table.Identifier, []table.Requirement, []table.Update) (table.Metadata, string, error) {
+	return nil, "", c.err
+}
+
+type alwaysConflictCatalog struct {
+	loader table.CatalogIO
+}
+
+func (c *alwaysConflictCatalog) LoadTable(ctx context.Context, ident table.Identifier) (*table.Table, error) {
+	return c.loader.LoadTable(ctx, ident)
+}
+
+func (c *alwaysConflictCatalog) CommitTable(context.Context, table.Identifier, []table.Requirement, []table.Update) (table.Metadata, string, error) {
+	return nil, "", table.ErrCommitFailed
 }

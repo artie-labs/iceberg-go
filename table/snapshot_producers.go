@@ -868,6 +868,7 @@ func (sp *snapshotProducer) newManifestWriter(spec iceberg.PartitionSpec, opts .
 	if err != nil {
 		return nil, "", nil, nil, errors.Join(err, out.Close(), sp.io.Remove(path))
 	}
+	sp.txn.recordStagedFile(path)
 
 	return wr, path, counter, out, nil
 }
@@ -1587,6 +1588,7 @@ func (sp *snapshotProducer) commitManifests(newManifests, addedContent []iceberg
 	if err != nil {
 		return nil, nil, err
 	}
+	sp.txn.recordStagedFile(manifestListFilePath)
 
 	snapshot := Snapshot{
 		SnapshotID:       sp.snapshotID,
@@ -1749,6 +1751,7 @@ func (sp *snapshotProducer) commitManifests(newManifests, addedContent []iceberg
 		if writeErr != nil {
 			return nil, fmt.Errorf("rebuild manifest list: write: %w", writeErr)
 		}
+		sp.txn.recordStagedFile(manifestListPath)
 
 		rebuilt := capturedSnapshot
 		rebuilt.ManifestList = manifestListPath
