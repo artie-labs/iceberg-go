@@ -852,6 +852,7 @@ func (sp *snapshotProducer) hasChanges() bool {
 	if len(sp.deletedDeleteFiles) > 0 {
 		return true
 	}
+
 	return len(sp.deletedDVsByRef) > 0
 }
 
