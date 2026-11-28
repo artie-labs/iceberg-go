@@ -1249,6 +1249,9 @@ type arrowScan struct {
 
 	// deleteMatcher, when set, narrows the rows a merge-on-read delete scan reports; see WithDeleteRowMatcher.
 	deleteMatcher *deleteRowMatcher
+	// existingDeleteBitmaps, when set, holds per-file already-deleted row positions (v3 DVs and legacy deletes)
+	// skipped before delete filters and deleteMatcher run.
+	existingDeleteBitmaps map[string]*dv.RoaringPositionBitmap
 
 	// arrowBatchSize, when positive, overrides the table's
 	// read.parquet.batch-size property for this scan's reads.
@@ -2294,6 +2297,16 @@ func (as *arrowScan) producePosDeletesFromTask(ctx context.Context, task tblutil
 		}
 
 		pipeline = append(pipeline, processPositionalDeletes(ctx, deletes, posSource.cursor()))
+	}
+	if as.existingDeleteBitmaps != nil {
+		if existingDV := as.existingDeleteBitmaps[task.Value.File.FilePath()]; existingDV != nil {
+			if !existingDV.IsEmpty() {
+				if len(positionalDeletes) > 0 {
+					return fmt.Errorf("cannot apply both positional delete files and deletion vector bitmap for %s", task.Value.File.FilePath())
+				}
+				pipeline = append(pipeline, filterByDeletionVector(ctx, existingDV, task.Value.File.Count(), posSource.cursor()))
+			}
+		}
 	}
 
 	filterFunc, dropFile, err = as.getRecordFilterFromPlan(ctx, filterPlans.record)
