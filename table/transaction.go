@@ -2869,7 +2869,7 @@ func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, upda
 	// per-batch filter function is reused across every record batch from
 	// every file in this rewrite — substrait conversion in particular is
 	// non-trivial so doing it inside the iterator loop wastes work.
-	postFilter, err := preparePreserveBatchFilter(filter, meta.CurrentSchema(), caseSensitive)
+	postFilter, err := preparePreserveBatchFilter(filter, meta.CurrentSchema(), caseSensitive, nil)
 	if err != nil {
 		return err
 	}
@@ -2901,6 +2901,9 @@ func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, upda
 	return nil
 }
 
+// preserveBatchFunc keeps the rows surviving a copy-on-write delete and returns how many rows were removed from rec.
+type preserveBatchFunc func(context.Context, arrow.RecordBatch) (arrow.RecordBatch, int64, error)
+
 // rewriteSingleFileArgs bundles the parameters for [Transaction.rewriteSingleFile]
 // — there are several same-typed fields (two filter values, plus a UUID and an
 // int) so positional ordering offers no compile-time order protection.
@@ -2920,7 +2923,7 @@ type rewriteSingleFileArgs struct {
 	// The scanner reads every row, unfiltered and unpruned, so a row the
 	// delete filter is null on is never dropped and _row_id positions stay
 	// correct.
-	postFilter    func(context.Context, arrow.RecordBatch) (arrow.RecordBatch, error)
+	postFilter    preserveBatchFunc
 	caseSensitive bool
 	commitUUID    uuid.UUID
 	concurrency   int
@@ -3012,7 +3015,7 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 				return
 			}
 
-			rec, err = args.postFilter(ctx, rec)
+			rec, _, err = args.postFilter(ctx, rec)
 			if err != nil {
 				yield(nil, err)
 
@@ -3609,18 +3612,26 @@ func (s *StagedTable) Scan(opts ...ScanOption) *Scan {
 // indices, so callers must pass the bound filter's schema verbatim — extra
 // trailing columns (e.g. row-lineage metadata) are tolerated only because
 // they live at indices past the filter's referenced fields.
-// preparePreserveBatchFilter returns a per-batch function keeping the rows filter is not true for: rows it is false
-// or null on. Filtering on iceberg.NewNot(filter) would drop the null rows, since NOT null is null.
-func preparePreserveBatchFilter(filter iceberg.BooleanExpression, schema *iceberg.Schema, caseSensitive bool) (func(context.Context, arrow.RecordBatch) (arrow.RecordBatch, error), error) {
-	keepNone := func(_ context.Context, rec arrow.RecordBatch) (arrow.RecordBatch, error) {
+// preparePreserveBatchFilter returns a per-batch function keeping the rows filter (and optional matcher) is not true
+// for: rows it is false or null on. Filtering on iceberg.NewNot(filter) would drop the null rows, since NOT null is null.
+func preparePreserveBatchFilter(filter iceberg.BooleanExpression, schema *iceberg.Schema, caseSensitive bool, matcher *deleteRowMatcher) (preserveBatchFunc, error) {
+	userCols := len(schema.Fields())
+	keepNone := func(ctx context.Context, rec arrow.RecordBatch) (arrow.RecordBatch, int64, error) {
+		if matcher != nil {
+			return preserveWithMatcherOnly(ctx, rec, matcher, userCols)
+		}
+		deleted := rec.NumRows()
 		defer rec.Release()
 
-		return rec.NewSlice(0, 0), nil
+		return rec.NewSlice(0, 0), deleted, nil
 	}
-	keepAll := func(_ context.Context, rec arrow.RecordBatch) (arrow.RecordBatch, error) {
-		return rec, nil
+	keepAll := func(_ context.Context, rec arrow.RecordBatch) (arrow.RecordBatch, int64, error) {
+		return rec, 0, nil
 	}
-	if filter == nil || filter.Equals(iceberg.AlwaysTrue{}) {
+	if filter == nil {
+		return keepNone, nil
+	}
+	if filter.Equals(iceberg.AlwaysTrue{}) {
 		return keepNone, nil
 	}
 
@@ -3628,7 +3639,10 @@ func preparePreserveBatchFilter(filter iceberg.BooleanExpression, schema *iceber
 	if err != nil {
 		return nil, fmt.Errorf("preparePreserveBatchFilter: bind expression: %w", err)
 	}
-	if bound == nil || bound.Equals(iceberg.AlwaysTrue{}) {
+	if bound == nil {
+		return keepNone, nil
+	}
+	if bound.Equals(iceberg.AlwaysTrue{}) {
 		return keepNone, nil
 	}
 	if bound.Equals(iceberg.AlwaysFalse{}) {
@@ -3640,62 +3654,222 @@ func preparePreserveBatchFilter(filter iceberg.BooleanExpression, schema *iceber
 		return nil, fmt.Errorf("preparePreserveBatchFilter: convert expression: %w", err)
 	}
 
-	return func(ctx context.Context, rec arrow.RecordBatch) (arrow.RecordBatch, error) {
-		defer rec.Release()
-
+	return func(ctx context.Context, rec arrow.RecordBatch) (arrow.RecordBatch, int64, error) {
 		ctx = exprs.WithExtensionIDSet(ctx, exprs.NewExtensionSetDefault(*extSet))
 		input := compute.NewDatumWithoutOwning(rec)
 		matched, err := exprs.ExecuteScalarExpression(ctx, rec.Schema(), substraitFilter, input)
 		if err != nil {
-			return nil, err
+			rec.Release()
+
+			return nil, 0, err
 		}
 		defer matched.Release()
 
-		keep, err := notTrueMask(matched, int(rec.NumRows()))
+		if matcher != nil {
+			return preserveWithFilterAndMatcher(ctx, rec, matched, matcher, userCols)
+		}
+
+		keep, deleted, err := datumMask(compute.GetAllocator(ctx), matched, int(rec.NumRows()), true)
 		if err != nil {
-			return nil, err
+			rec.Release()
+
+			return nil, 0, err
 		}
 		defer keep.Release()
 
-		result, err := compute.Filter(ctx, input, compute.NewDatumWithoutOwning(keep), *compute.DefaultFilterOptions())
-		if err != nil {
-			return nil, err
-		}
-
-		return result.(*compute.RecordDatum).Value, nil
+		return filterKeepRows(ctx, rec, keep, deleted)
 	}, nil
 }
 
-// notTrueMask returns a mask that is true where matched is false or null.
-func notTrueMask(matched compute.Datum, numRows int) (*array.Boolean, error) {
-	builder := array.NewBooleanBuilder(memory.DefaultAllocator)
+func evalDeleteRowMatcher(ctx context.Context, matcher *deleteRowMatcher, batch arrow.RecordBatch, userCols int) (*array.Boolean, error) {
+	matcherInput := batch
+	if int(batch.NumCols()) > userCols {
+		userSchema := arrow.NewSchema(batch.Schema().Fields()[:userCols], nil)
+		matcherInput = array.NewRecordBatch(userSchema, batch.Columns()[:userCols], batch.NumRows())
+		defer matcherInput.Release()
+	}
+	mask, err := matcher.match(ctx, matcherInput)
+	if err != nil {
+		return nil, err
+	}
+	if mask == nil {
+		return nil, errors.New("delete row matcher returned no mask")
+	}
+	if mask.Len() != int(batch.NumRows()) {
+		length := mask.Len()
+		mask.Release()
+
+		return nil, fmt.Errorf("delete row matcher returned %d values for %d rows", length, batch.NumRows())
+	}
+
+	return mask, nil
+}
+
+func filterKeepRows(ctx context.Context, rec arrow.RecordBatch, keep *array.Boolean, deleted int64) (arrow.RecordBatch, int64, error) {
+	if deleted == 0 {
+		return rec, 0, nil
+	}
+	defer rec.Release()
+
+	filtered, err := compute.FilterRecordBatch(ctx, rec, keep, compute.DefaultFilterOptions())
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return filtered, deleted, nil
+}
+
+func preserveWithMatcherOnly(ctx context.Context, rec arrow.RecordBatch, matcher *deleteRowMatcher, userCols int) (arrow.RecordBatch, int64, error) {
+	if rec.NumRows() == 0 {
+		return rec, 0, nil
+	}
+	mask, err := evalDeleteRowMatcher(ctx, matcher, rec, userCols)
+	if err != nil {
+		rec.Release()
+
+		return nil, 0, err
+	}
+	defer mask.Release()
+
+	alloc := compute.GetAllocator(ctx)
+	builder := array.NewBooleanBuilder(alloc)
+	defer builder.Release()
+	numRows := int(rec.NumRows())
+	builder.Reserve(numRows)
+
+	var deleted int64
+	for i := range numRows {
+		if mask.IsValid(i) {
+			if mask.Value(i) {
+				builder.UnsafeAppend(false)
+				deleted++
+
+				continue
+			}
+		}
+		builder.UnsafeAppend(true)
+	}
+	keep := builder.NewBooleanArray()
+	defer keep.Release()
+
+	return filterKeepRows(ctx, rec, keep, deleted)
+}
+
+func preserveWithFilterAndMatcher(ctx context.Context, rec arrow.RecordBatch, filterDatum compute.Datum, matcher *deleteRowMatcher, userCols int) (arrow.RecordBatch, int64, error) {
+	alloc := compute.GetAllocator(ctx)
+	numRows := int(rec.NumRows())
+	filterTrue, matchedCount, err := datumMask(alloc, filterDatum, numRows, false)
+	if err != nil {
+		rec.Release()
+
+		return nil, 0, err
+	}
+	defer filterTrue.Release()
+	if matchedCount == 0 {
+		return rec, 0, nil
+	}
+	if int(matchedCount) == numRows {
+		return preserveWithMatcherOnly(ctx, rec, matcher, userCols)
+	}
+
+	candidates, err := compute.FilterRecordBatch(ctx, rec, filterTrue, compute.DefaultFilterOptions())
+	if err != nil {
+		rec.Release()
+
+		return nil, 0, err
+	}
+	defer candidates.Release()
+
+	matcherMask, err := evalDeleteRowMatcher(ctx, matcher, candidates, userCols)
+	if err != nil {
+		rec.Release()
+
+		return nil, 0, err
+	}
+	defer matcherMask.Release()
+
+	builder := array.NewBooleanBuilder(alloc)
 	defer builder.Release()
 	builder.Reserve(numRows)
 
+	var deleted int64
+	candIdx := 0
+	for i := range numRows {
+		if !filterTrue.Value(i) {
+			builder.UnsafeAppend(true)
+
+			continue
+		}
+		deleteRow := false
+		if matcherMask.IsValid(candIdx) {
+			deleteRow = matcherMask.Value(candIdx)
+		}
+		candIdx++
+		if deleteRow {
+			builder.UnsafeAppend(false)
+			deleted++
+
+			continue
+		}
+		builder.UnsafeAppend(true)
+	}
+	keep := builder.NewBooleanArray()
+	defer keep.Release()
+
+	return filterKeepRows(ctx, rec, keep, deleted)
+}
+
+// datumMask converts a boolean filter datum into a non-null mask of length numRows and returns the count of rows where
+// matched is valid and true. When invert is false, the mask marks matched rows; when invert is true, it marks surviving
+// (false or null) rows.
+func datumMask(alloc memory.Allocator, matched compute.Datum, numRows int, invert bool) (*array.Boolean, int64, error) {
+	builder := array.NewBooleanBuilder(alloc)
+	defer builder.Release()
+	builder.Reserve(numRows)
+
+	var trueCount int64
 	switch matched := matched.(type) {
 	case *compute.ArrayDatum:
-		values, ok := matched.MakeArray().(*array.Boolean)
+		arr := matched.MakeArray()
+		defer arr.Release()
+		values, ok := arr.(*array.Boolean)
 		if !ok {
-			return nil, fmt.Errorf("delete filter returned %s, not boolean", matched.Type())
+			return nil, 0, fmt.Errorf("delete filter returned %s, not boolean", matched.Type())
 		}
-		defer values.Release()
+		if values.Len() != numRows {
+			return nil, 0, fmt.Errorf("delete filter returned %d values for %d rows", values.Len(), numRows)
+		}
 		for i := range values.Len() {
-			builder.UnsafeAppend(!values.IsValid(i) || !values.Value(i))
+			isTrue := false
+			if values.IsValid(i) {
+				isTrue = values.Value(i)
+			}
+			if isTrue {
+				trueCount++
+			}
+			builder.UnsafeAppend(isTrue != invert)
 		}
 	case *compute.ScalarDatum:
 		value, ok := matched.Value.(*scalar.Boolean)
 		if !ok {
-			return nil, fmt.Errorf("delete filter returned %s, not boolean", matched.Type())
+			return nil, 0, fmt.Errorf("delete filter returned %s, not boolean", matched.Type())
 		}
-		keep := !value.IsValid() || !value.Value
+		isTrue := false
+		if value.IsValid() {
+			isTrue = value.Value
+		}
+		if isTrue {
+			trueCount = int64(numRows)
+		}
+		bit := isTrue != invert
 		for range numRows {
-			builder.UnsafeAppend(keep)
+			builder.UnsafeAppend(bit)
 		}
 	default:
-		return nil, fmt.Errorf("delete filter returned unexpected %s datum", matched.Kind())
+		return nil, 0, fmt.Errorf("delete filter returned unexpected %s datum", matched.Kind())
 	}
 
-	return builder.NewBooleanArray(), nil
+	return builder.NewBooleanArray(), trueCount, nil
 }
 
 func prepareBatchFilter(filter iceberg.BooleanExpression, schema *iceberg.Schema, caseSensitive bool) (func(context.Context, arrow.RecordBatch) (arrow.RecordBatch, error), error) {
