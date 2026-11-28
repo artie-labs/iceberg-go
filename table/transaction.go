@@ -27,7 +27,6 @@ import (
 	"iter"
 	"log/slog"
 	"maps"
-	"os"
 	"runtime"
 	"slices"
 	"strconv"
@@ -163,6 +162,22 @@ func (t *Transaction) txnMeta() (*MetadataBuilder, error) {
 func (t *Transaction) checkNotNil() error {
 	if t == nil {
 		return fmt.Errorf("%w: transaction is nil", ErrInvalidMetadata)
+	}
+
+	return nil
+}
+
+func (t *Transaction) checkActive() error {
+	if err := t.checkNotNil(); err != nil {
+		return err
+	}
+	t.mx.Lock()
+	defer t.mx.Unlock()
+	if t.committed {
+		return errors.New("transaction has already been committed")
+	}
+	if t.aborted {
+		return errors.New("transaction has been aborted")
 	}
 
 	return nil
@@ -903,6 +918,9 @@ func (t *Transaction) AppendTable(ctx context.Context, tbl arrow.Table, batchSiz
 }
 
 func (t *Transaction) Append(ctx context.Context, rdr array.RecordReader, snapshotProps iceberg.Properties) error {
+	if err := t.checkActive(); err != nil {
+		return err
+	}
 	meta, err := t.txnMeta()
 	if err != nil {
 		return err
@@ -2391,6 +2409,9 @@ func WithOverwriteCaseInsensitive() OverwriteOption {
 // can be overridden using the WithOverwriteConcurrency option.
 // If concurrency <= 0, defaults to runtime.GOMAXPROCS(0).
 func (t *Transaction) Overwrite(ctx context.Context, rdr array.RecordReader, snapshotProps iceberg.Properties, opts ...OverwriteOption) error {
+	if err := t.checkActive(); err != nil {
+		return err
+	}
 	if _, err := t.txnMeta(); err != nil {
 		return err
 	}
@@ -2497,7 +2518,13 @@ func (t *Transaction) performCopyOnWriteDeletion(ctx context.Context, operation 
 	}
 
 	if len(filesToRewrite) > 0 {
-		if err := t.rewriteFilesWithFilter(ctx, fs, updater, filesToRewrite, fileSeqByPath, filter, caseSensitive, concurrency); err != nil {
+		// A rewritten file replaces its original and every delete file that applies to it, so it is read with those
+		// deletes: otherwise rows they already deleted would come back.
+		deletes, err := t.plannedDeletesForFilter(ctx, meta, filter, caseSensitive, concurrency)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := t.rewriteFilesWithFilter(ctx, fs, updater, filesToRewrite, fileSeqByPath, deletes, filter, caseSensitive, concurrency); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -2638,6 +2665,9 @@ func WithDeleteCaseInsensitive() DeleteOption {
 // The concurrency parameter controls the level of parallelism for manifest processing and file rewriting and
 // can be overridden using the WithOverwriteConcurrency option. Defaults to runtime.GOMAXPROCS(0).
 func (t *Transaction) Delete(ctx context.Context, filter iceberg.BooleanExpression, snapshotProps iceberg.Properties, opts ...DeleteOption) (err error) {
+	if err := t.checkActive(); err != nil {
+		return err
+	}
 	meta, err := t.txnMeta()
 	if err != nil {
 		return err
@@ -2870,9 +2900,10 @@ func (t *Transaction) classifyFilesForFilteredDeletions(ctx context.Context, fs 
 // rewriteFilesWithFilter rewrites data files by preserving only rows the filter is not true for. A row the filter
 // evaluates to null on (a comparison on a null column) is kept, since Delete removes only rows the filter matches.
 // fileSeqByPath maps each file's path to its file_sequence_number from the source manifest entry,
-// used to synthesize _last_updated_sequence_number when the source row's value is null. The
+// used to synthesize _last_updated_sequence_number when the source row's value is null. deletes maps
+// each file's path to its planned scan task, whose delete files are applied when the file is read. The
 // filter binding and substrait conversion are computed once here and reused across every file.
-func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, updater *snapshotProducer, files []iceberg.DataFile, fileSeqByPath map[string]*int64, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) error {
+func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, updater *snapshotProducer, files []iceberg.DataFile, fileSeqByPath map[string]*int64, deletes map[string]FileScanTask, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) error {
 	meta, err := t.txnMeta()
 	if err != nil {
 		return err
@@ -2882,11 +2913,17 @@ func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, upda
 	// per-batch filter function is reused across every record batch from
 	// every file in this rewrite — substrait conversion in particular is
 	// non-trivial so doing it inside the iterator loop wastes work.
-	postFilter, err := preparePreserveBatchFilter(filter, meta.CurrentSchema(), caseSensitive)
+	postFilter, err := preparePreserveBatchFilter(filter, meta.CurrentSchema(), caseSensitive, nil)
 	if err != nil {
 		return err
 	}
 
+	wfs, err := requireWriteFileIO(fs)
+	if err != nil {
+		return err
+	}
+
+	var writtenPaths []string
 	for _, originalFile := range files {
 		// Use a separate UUID for rewrite operations to avoid filename collisions with new data files
 		rewriteUUID := uuid.New()
@@ -2894,6 +2931,7 @@ func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, upda
 			fs:            fs,
 			originalFile:  originalFile,
 			fileSeqNum:    fileSeqByPath[originalFile.FilePath()],
+			deletes:       deletes[originalFile.FilePath()],
 			postFilter:    postFilter,
 			caseSensitive: caseSensitive,
 			commitUUID:    rewriteUUID,
@@ -2901,18 +2939,25 @@ func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, upda
 		}
 		rewrittenFiles, err := t.rewriteSingleFile(ctx, args)
 		if err != nil {
-			return fmt.Errorf("failed to rewrite file %s: %w", originalFile.FilePath(), err)
+			_, removeErr := removeStagedPaths(wfs, writtenPaths)
+
+			return errors.Join(fmt.Errorf("failed to rewrite file %s: %w", originalFile.FilePath(), err), removeErr)
 		}
 
 		updater.deleteDataFile(originalFile)
 		for _, rewrittenFile := range rewrittenFiles {
-			t.recordStagedFile(rewrittenFile.FilePath())
+			path := rewrittenFile.FilePath()
+			writtenPaths = append(writtenPaths, path)
+			t.recordStagedFile(path)
 			updater.appendDataFile(rewrittenFile)
 		}
 	}
 
 	return nil
 }
+
+// preserveBatchFunc keeps the rows surviving a copy-on-write delete and returns how many rows were removed from rec.
+type preserveBatchFunc func(context.Context, arrow.RecordBatch) (arrow.RecordBatch, int64, error)
 
 // rewriteSingleFileArgs bundles the parameters for [Transaction.rewriteSingleFile]
 // — there are several same-typed fields (two filter values, plus a UUID and an
@@ -2924,12 +2969,16 @@ type rewriteSingleFileArgs struct {
 	// manifest entry; required to synthesize _last_updated_sequence_number
 	// for rows whose value is null in the source file.
 	fileSeqNum *int64
+	// deletes is the file's planned scan task; its position deletes, equality
+	// deletes and deletion vectors are applied when the file is read. A zero
+	// value applies none.
+	deletes FileScanTask
 	// postFilter keeps the rows that survive the rewrite: those the delete
 	// filter is not true for. It is the only place the filter is evaluated.
 	// The scanner reads every row, unfiltered and unpruned, so a row the
 	// delete filter is null on is never dropped and _row_id positions stay
 	// correct.
-	postFilter    func(context.Context, arrow.RecordBatch) (arrow.RecordBatch, error)
+	postFilter    preserveBatchFunc
 	caseSensitive bool
 	commitUUID    uuid.UUID
 	concurrency   int
@@ -2945,9 +2994,12 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 	}
 
 	scanTask := &FileScanTask{
-		File:   args.originalFile,
-		Start:  0,
-		Length: args.originalFile.FileSizeBytes(),
+		File:                args.originalFile,
+		DeleteFiles:         args.deletes.DeleteFiles,
+		EqualityDeleteFiles: args.deletes.EqualityDeleteFiles,
+		DeletionVectorFiles: args.deletes.DeletionVectorFiles,
+		Start:               0,
+		Length:              args.originalFile.FileSizeBytes(),
 	}
 
 	// Preserve row lineage for v3 tables: include _row_id and
@@ -3018,7 +3070,7 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 				return
 			}
 
-			rec, err = args.postFilter(ctx, rec)
+			rec, _, err = args.postFilter(ctx, rec)
 			if err != nil {
 				yield(nil, err)
 
@@ -3055,7 +3107,9 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 
 	for df, err := range itr {
 		if err != nil {
-			return nil, err
+			_, removeErr := removeDataFiles(wfs, result)
+
+			return nil, errors.Join(err, removeErr)
 		}
 		result = append(result, df)
 	}
@@ -3130,9 +3184,24 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 		scanDeletes = nil
 	}
 
-	posDeleteRecIter, err := t.makePositionDeleteRecordsForFilter(ctx, fs, files, scanDeletes, filter, caseSensitive, concurrency, matcher)
+	posDeleteRecIter, err := t.makePositionDeleteRecordsForFilter(ctx, fs, files, scanDeletes, existingDVBitmaps, filter, caseSensitive, concurrency, matcher)
 	if err != nil {
 		return nil, err
+	}
+	releasePosDeleteRecIter := func(yield func(arrow.RecordBatch, error) bool) {
+		for rec, err := range posDeleteRecIter {
+			if err != nil {
+				yield(nil, err)
+
+				return
+			}
+			if !yield(rec, nil) {
+				rec.Release()
+
+				return
+			}
+			rec.Release()
+		}
 	}
 
 	partitionContextByFilePath := make(map[string]partitionContext, len(files))
@@ -3142,24 +3211,31 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 
 	posDeleteFiles := positionDeleteRecordsToDataFiles(ctx, t.tbl.Location(), meta, partitionContextByFilePath, recordWritingArgs{
 		sc:          PositionalDeleteArrowSchema,
-		itr:         posDeleteRecIter,
+		itr:         releasePosDeleteRecIter,
 		writeUUID:   &commitUUID,
 		fs:          wfs,
 		existingDVs: existingDVBitmaps,
 	})
 
 	var referenced []string
+	var writtenPaths []string
 	seen := make(map[string]struct{})
 	for f, err := range posDeleteFiles {
 		if err != nil {
-			return nil, err
+			_, removeErr := removeStagedPaths(wfs, writtenPaths)
+
+			return nil, errors.Join(err, removeErr)
 		}
-		t.recordStagedFile(f.FilePath())
+		path := f.FilePath()
+		writtenPaths = append(writtenPaths, path)
+		t.recordStagedFile(path)
 		updater.appendDeleteFile(f)
-		if ref := iceberginternal.BorrowedDataFileReferencedDataFile(f); ref != nil && *ref != "" {
-			if _, ok := seen[*ref]; !ok {
-				seen[*ref] = struct{}{}
-				referenced = append(referenced, *ref)
+		if ref := iceberginternal.BorrowedDataFileReferencedDataFile(f); ref != nil {
+			if *ref != "" {
+				if _, ok := seen[*ref]; !ok {
+					seen[*ref] = struct{}{}
+					referenced = append(referenced, *ref)
+				}
 			}
 		}
 	}
@@ -3277,6 +3353,24 @@ func legacyPositionDeleteBitmaps(ctx context.Context, fs io.IO, files []iceberg.
 // vector instead, since readers ignore a file's Parquet position deletes once it has one. Rows removed by equality deletes still
 // match and get position deletes, which only inflates the totals.
 func (t *Transaction) positionDeletesForFilter(ctx context.Context, meta *MetadataBuilder, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) (map[string][]iceberg.DataFile, error) {
+	planned, err := t.plannedDeletesForFilter(ctx, meta, filter, caseSensitive, concurrency)
+	if err != nil {
+		return nil, err
+	}
+	deletes := make(map[string][]iceberg.DataFile, len(planned))
+	for path, task := range planned {
+		if len(task.DeleteFiles) > 0 {
+			deletes[path] = task.DeleteFiles
+		}
+	}
+
+	return deletes, nil
+}
+
+// plannedDeletesForFilter plans the data files filter may match on the transaction's planning snapshot and returns
+// each one's scan task, keyed by data file path, for the delete files that apply to it. A delete file is kept even
+// when its stats can't match filter: it still applies to the rows filter doesn't match.
+func (t *Transaction) plannedDeletesForFilter(ctx context.Context, meta *MetadataBuilder, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) (map[string]FileScanTask, error) {
 	snapshot := t.planningSnapshot(meta)
 	if snapshot == nil {
 		return nil, nil
@@ -3289,21 +3383,20 @@ func (t *Transaction) positionDeletesForFilter(ctx context.Context, meta *Metada
 	// Bind the filter to the current schema, as the delete does: it may name a column added after snapshot was written.
 	currentSchema := false
 	scan.useSnapshotSchema = &currentSchema
+	scan.keepDeletesOutsideFilter = true
 	planned, err := scan.PlanFiles(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to plan existing position deletes: %w", err)
+		return nil, fmt.Errorf("failed to plan existing deletes: %w", err)
 	}
-	deletes := make(map[string][]iceberg.DataFile, len(planned))
+	tasks := make(map[string]FileScanTask, len(planned))
 	for _, task := range planned {
-		if len(task.DeleteFiles) > 0 {
-			deletes[task.File.FilePath()] = task.DeleteFiles
-		}
+		tasks[task.File.FilePath()] = task
 	}
 
-	return deletes, nil
+	return tasks, nil
 }
 
-func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs io.IO, files []iceberg.DataFile, existingDeletes map[string][]iceberg.DataFile, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int, matcher *deleteRowMatcher) (seq2 iter.Seq2[arrow.RecordBatch, error], err error) {
+func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs io.IO, files []iceberg.DataFile, existingDeletes map[string][]iceberg.DataFile, existingDVBitmaps map[string]*dv.RoaringPositionBitmap, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int, matcher *deleteRowMatcher) (seq2 iter.Seq2[arrow.RecordBatch, error], err error) {
 	meta, err := t.txnMeta()
 	if err != nil {
 		return nil, err
@@ -3356,15 +3449,16 @@ func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs
 	}
 
 	scanner := &arrowScan{
-		metadata:        builtMeta,
-		fs:              fs,
-		scanSchema:      meta.CurrentSchema(),
-		projectedSchema: projected,
-		boundRowFilter:  boundFilter,
-		caseSensitive:   caseSensitive,
-		rowLimit:        -1, // No limit
-		concurrency:     concurrency,
-		deleteMatcher:   matcher,
+		metadata:              builtMeta,
+		fs:                    fs,
+		scanSchema:            meta.CurrentSchema(),
+		projectedSchema:       projected,
+		boundRowFilter:        boundFilter,
+		caseSensitive:         caseSensitive,
+		rowLimit:              -1, // No limit
+		concurrency:           concurrency,
+		deleteMatcher:         matcher,
+		existingDeleteBitmaps: existingDVBitmaps,
 	}
 	invariants, err := scanner.scanInvariants(builtMeta.Properties())
 	if err != nil {
@@ -3565,12 +3659,13 @@ func (t *Transaction) Commit(ctx context.Context) (*Table, error) {
 	return t.tbl, nil
 }
 
-// CleanupStagedFiles removes data, delete, manifest, and manifest-list files written by this transaction when it has
-// not been committed and did not end in an uncertain commit outcome. Once Commit succeeds or fails with a non-conflict
-// error whose catalog outcome is unknown, t.committed is true and CleanupStagedFiles is a no-op so referenced files
-// are never removed. Calling CleanupStagedFiles marks the transaction aborted so it cannot be committed afterwards;
-// if resolving FileIO or removing a subset of files fails, the unremoved paths remain tracked so a retry with a fresh
-// context can complete cleanup.
+// CleanupStagedFiles removes data, delete, manifest, and manifest-list files written by this transaction (via Append,
+// Overwrite, Delete, WriteEqualityDeletes, and snapshot producers) when it has not been committed and did not end in
+// an uncertain commit outcome. Once Commit succeeds or fails with a non-conflict error whose catalog outcome is
+// unknown, t.committed is true and CleanupStagedFiles is a no-op so referenced files are never removed. Calling
+// CleanupStagedFiles marks the transaction aborted so it cannot be committed afterwards; if resolving FileIO or
+// removing a subset of files fails, the unremoved paths remain tracked so a retry with a fresh context can complete
+// cleanup.
 func (t *Transaction) CleanupStagedFiles(ctx context.Context) error {
 	if err := t.checkNotNil(); err != nil {
 		return err
@@ -3621,6 +3716,15 @@ func (t *Transaction) recordStagedFiles(paths []string) {
 	t.stagedMu.Unlock()
 }
 
+func removeDataFiles(wfs io.WriteFileIO, files []iceberg.DataFile) ([]string, error) {
+	paths := make([]string, len(files))
+	for i, df := range files {
+		paths[i] = df.FilePath()
+	}
+
+	return removeStagedPaths(wfs, paths)
+}
+
 func removeStagedPaths(wfs io.WriteFileIO, paths []string) ([]string, error) {
 	seen := make(map[string]struct{}, len(paths))
 	var remaining []string
@@ -3638,9 +3742,6 @@ func removeStagedPaths(wfs io.WriteFileIO, paths []string) ([]string, error) {
 			continue
 		}
 		if errors.Is(err, iofs.ErrNotExist) {
-			continue
-		}
-		if os.IsNotExist(err) {
 			continue
 		}
 		remaining = append(remaining, path)
@@ -3691,18 +3792,26 @@ func (s *StagedTable) Scan(opts ...ScanOption) *Scan {
 // indices, so callers must pass the bound filter's schema verbatim — extra
 // trailing columns (e.g. row-lineage metadata) are tolerated only because
 // they live at indices past the filter's referenced fields.
-// preparePreserveBatchFilter returns a per-batch function keeping the rows filter is not true for: rows it is false
-// or null on. Filtering on iceberg.NewNot(filter) would drop the null rows, since NOT null is null.
-func preparePreserveBatchFilter(filter iceberg.BooleanExpression, schema *iceberg.Schema, caseSensitive bool) (func(context.Context, arrow.RecordBatch) (arrow.RecordBatch, error), error) {
-	keepNone := func(_ context.Context, rec arrow.RecordBatch) (arrow.RecordBatch, error) {
+// preparePreserveBatchFilter returns a per-batch function keeping the rows filter (and optional matcher) is not true
+// for: rows it is false or null on. Filtering on iceberg.NewNot(filter) would drop the null rows, since NOT null is null.
+func preparePreserveBatchFilter(filter iceberg.BooleanExpression, schema *iceberg.Schema, caseSensitive bool, matcher *deleteRowMatcher) (preserveBatchFunc, error) {
+	userCols := len(schema.Fields())
+	keepNone := func(ctx context.Context, rec arrow.RecordBatch) (arrow.RecordBatch, int64, error) {
+		if matcher != nil {
+			return preserveWithMatcherOnly(ctx, rec, matcher, userCols)
+		}
+		deleted := rec.NumRows()
 		defer rec.Release()
 
-		return rec.NewSlice(0, 0), nil
+		return rec.NewSlice(0, 0), deleted, nil
 	}
-	keepAll := func(_ context.Context, rec arrow.RecordBatch) (arrow.RecordBatch, error) {
-		return rec, nil
+	keepAll := func(_ context.Context, rec arrow.RecordBatch) (arrow.RecordBatch, int64, error) {
+		return rec, 0, nil
 	}
-	if filter == nil || filter.Equals(iceberg.AlwaysTrue{}) {
+	if filter == nil {
+		return keepNone, nil
+	}
+	if filter.Equals(iceberg.AlwaysTrue{}) {
 		return keepNone, nil
 	}
 
@@ -3710,7 +3819,10 @@ func preparePreserveBatchFilter(filter iceberg.BooleanExpression, schema *iceber
 	if err != nil {
 		return nil, fmt.Errorf("preparePreserveBatchFilter: bind expression: %w", err)
 	}
-	if bound == nil || bound.Equals(iceberg.AlwaysTrue{}) {
+	if bound == nil {
+		return keepNone, nil
+	}
+	if bound.Equals(iceberg.AlwaysTrue{}) {
 		return keepNone, nil
 	}
 	if bound.Equals(iceberg.AlwaysFalse{}) {
@@ -3722,62 +3834,222 @@ func preparePreserveBatchFilter(filter iceberg.BooleanExpression, schema *iceber
 		return nil, fmt.Errorf("preparePreserveBatchFilter: convert expression: %w", err)
 	}
 
-	return func(ctx context.Context, rec arrow.RecordBatch) (arrow.RecordBatch, error) {
-		defer rec.Release()
-
+	return func(ctx context.Context, rec arrow.RecordBatch) (arrow.RecordBatch, int64, error) {
 		ctx = exprs.WithExtensionIDSet(ctx, exprs.NewExtensionSetDefault(*extSet))
 		input := compute.NewDatumWithoutOwning(rec)
 		matched, err := exprs.ExecuteScalarExpression(ctx, rec.Schema(), substraitFilter, input)
 		if err != nil {
-			return nil, err
+			rec.Release()
+
+			return nil, 0, err
 		}
 		defer matched.Release()
 
-		keep, err := notTrueMask(matched, int(rec.NumRows()))
+		if matcher != nil {
+			return preserveWithFilterAndMatcher(ctx, rec, matched, matcher, userCols)
+		}
+
+		keep, deleted, err := datumMask(compute.GetAllocator(ctx), matched, int(rec.NumRows()), true)
 		if err != nil {
-			return nil, err
+			rec.Release()
+
+			return nil, 0, err
 		}
 		defer keep.Release()
 
-		result, err := compute.Filter(ctx, input, compute.NewDatumWithoutOwning(keep), *compute.DefaultFilterOptions())
-		if err != nil {
-			return nil, err
-		}
-
-		return result.(*compute.RecordDatum).Value, nil
+		return filterKeepRows(ctx, rec, keep, deleted)
 	}, nil
 }
 
-// notTrueMask returns a mask that is true where matched is false or null.
-func notTrueMask(matched compute.Datum, numRows int) (*array.Boolean, error) {
-	builder := array.NewBooleanBuilder(memory.DefaultAllocator)
+func evalDeleteRowMatcher(ctx context.Context, matcher *deleteRowMatcher, batch arrow.RecordBatch, userCols int) (*array.Boolean, error) {
+	matcherInput := batch
+	if int(batch.NumCols()) > userCols {
+		userSchema := arrow.NewSchema(batch.Schema().Fields()[:userCols], nil)
+		matcherInput = array.NewRecordBatch(userSchema, batch.Columns()[:userCols], batch.NumRows())
+		defer matcherInput.Release()
+	}
+	mask, err := matcher.match(ctx, matcherInput)
+	if err != nil {
+		return nil, err
+	}
+	if mask == nil {
+		return nil, errors.New("delete row matcher returned no mask")
+	}
+	if mask.Len() != int(batch.NumRows()) {
+		length := mask.Len()
+		mask.Release()
+
+		return nil, fmt.Errorf("delete row matcher returned %d values for %d rows", length, batch.NumRows())
+	}
+
+	return mask, nil
+}
+
+func filterKeepRows(ctx context.Context, rec arrow.RecordBatch, keep *array.Boolean, deleted int64) (arrow.RecordBatch, int64, error) {
+	if deleted == 0 {
+		return rec, 0, nil
+	}
+	defer rec.Release()
+
+	filtered, err := compute.FilterRecordBatch(ctx, rec, keep, compute.DefaultFilterOptions())
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return filtered, deleted, nil
+}
+
+func preserveWithMatcherOnly(ctx context.Context, rec arrow.RecordBatch, matcher *deleteRowMatcher, userCols int) (arrow.RecordBatch, int64, error) {
+	if rec.NumRows() == 0 {
+		return rec, 0, nil
+	}
+	mask, err := evalDeleteRowMatcher(ctx, matcher, rec, userCols)
+	if err != nil {
+		rec.Release()
+
+		return nil, 0, err
+	}
+	defer mask.Release()
+
+	alloc := compute.GetAllocator(ctx)
+	builder := array.NewBooleanBuilder(alloc)
+	defer builder.Release()
+	numRows := int(rec.NumRows())
+	builder.Reserve(numRows)
+
+	var deleted int64
+	for i := range numRows {
+		if mask.IsValid(i) {
+			if mask.Value(i) {
+				builder.UnsafeAppend(false)
+				deleted++
+
+				continue
+			}
+		}
+		builder.UnsafeAppend(true)
+	}
+	keep := builder.NewBooleanArray()
+	defer keep.Release()
+
+	return filterKeepRows(ctx, rec, keep, deleted)
+}
+
+func preserveWithFilterAndMatcher(ctx context.Context, rec arrow.RecordBatch, filterDatum compute.Datum, matcher *deleteRowMatcher, userCols int) (arrow.RecordBatch, int64, error) {
+	alloc := compute.GetAllocator(ctx)
+	numRows := int(rec.NumRows())
+	filterTrue, matchedCount, err := datumMask(alloc, filterDatum, numRows, false)
+	if err != nil {
+		rec.Release()
+
+		return nil, 0, err
+	}
+	defer filterTrue.Release()
+	if matchedCount == 0 {
+		return rec, 0, nil
+	}
+	if int(matchedCount) == numRows {
+		return preserveWithMatcherOnly(ctx, rec, matcher, userCols)
+	}
+
+	candidates, err := compute.FilterRecordBatch(ctx, rec, filterTrue, compute.DefaultFilterOptions())
+	if err != nil {
+		rec.Release()
+
+		return nil, 0, err
+	}
+	defer candidates.Release()
+
+	matcherMask, err := evalDeleteRowMatcher(ctx, matcher, candidates, userCols)
+	if err != nil {
+		rec.Release()
+
+		return nil, 0, err
+	}
+	defer matcherMask.Release()
+
+	builder := array.NewBooleanBuilder(alloc)
 	defer builder.Release()
 	builder.Reserve(numRows)
 
+	var deleted int64
+	candIdx := 0
+	for i := range numRows {
+		if !filterTrue.Value(i) {
+			builder.UnsafeAppend(true)
+
+			continue
+		}
+		deleteRow := false
+		if matcherMask.IsValid(candIdx) {
+			deleteRow = matcherMask.Value(candIdx)
+		}
+		candIdx++
+		if deleteRow {
+			builder.UnsafeAppend(false)
+			deleted++
+
+			continue
+		}
+		builder.UnsafeAppend(true)
+	}
+	keep := builder.NewBooleanArray()
+	defer keep.Release()
+
+	return filterKeepRows(ctx, rec, keep, deleted)
+}
+
+// datumMask converts a boolean filter datum into a non-null mask of length numRows and returns the count of rows where
+// matched is valid and true. When invert is false, the mask marks matched rows; when invert is true, it marks surviving
+// (false or null) rows.
+func datumMask(alloc memory.Allocator, matched compute.Datum, numRows int, invert bool) (*array.Boolean, int64, error) {
+	builder := array.NewBooleanBuilder(alloc)
+	defer builder.Release()
+	builder.Reserve(numRows)
+
+	var trueCount int64
 	switch matched := matched.(type) {
 	case *compute.ArrayDatum:
-		values, ok := matched.MakeArray().(*array.Boolean)
+		arr := matched.MakeArray()
+		defer arr.Release()
+		values, ok := arr.(*array.Boolean)
 		if !ok {
-			return nil, fmt.Errorf("delete filter returned %s, not boolean", matched.Type())
+			return nil, 0, fmt.Errorf("delete filter returned %s, not boolean", matched.Type())
 		}
-		defer values.Release()
+		if values.Len() != numRows {
+			return nil, 0, fmt.Errorf("delete filter returned %d values for %d rows", values.Len(), numRows)
+		}
 		for i := range values.Len() {
-			builder.UnsafeAppend(!values.IsValid(i) || !values.Value(i))
+			isTrue := false
+			if values.IsValid(i) {
+				isTrue = values.Value(i)
+			}
+			if isTrue {
+				trueCount++
+			}
+			builder.UnsafeAppend(isTrue != invert)
 		}
 	case *compute.ScalarDatum:
 		value, ok := matched.Value.(*scalar.Boolean)
 		if !ok {
-			return nil, fmt.Errorf("delete filter returned %s, not boolean", matched.Type())
+			return nil, 0, fmt.Errorf("delete filter returned %s, not boolean", matched.Type())
 		}
-		keep := !value.IsValid() || !value.Value
+		isTrue := false
+		if value.IsValid() {
+			isTrue = value.Value
+		}
+		if isTrue {
+			trueCount = int64(numRows)
+		}
+		bit := isTrue != invert
 		for range numRows {
-			builder.UnsafeAppend(keep)
+			builder.UnsafeAppend(bit)
 		}
 	default:
-		return nil, fmt.Errorf("delete filter returned unexpected %s datum", matched.Kind())
+		return nil, 0, fmt.Errorf("delete filter returned unexpected %s datum", matched.Kind())
 	}
 
-	return builder.NewBooleanArray(), nil
+	return builder.NewBooleanArray(), trueCount, nil
 }
 
 func prepareBatchFilter(filter iceberg.BooleanExpression, schema *iceberg.Schema, caseSensitive bool) (func(context.Context, arrow.RecordBatch) (arrow.RecordBatch, error), error) {

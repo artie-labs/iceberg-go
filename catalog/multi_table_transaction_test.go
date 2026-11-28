@@ -429,3 +429,59 @@ func TestMultiTableTransactionSkipsTransactionsWithoutUpdates(t *testing.T) {
 		assert.ErrorContains(t, err, "already been committed")
 	})
 }
+
+func TestMultiTableTransactionAbortedAndUncertainCommit(t *testing.T) {
+	{
+		// Aborted transaction is rejected by AddTransaction and Commit.
+		stub := &fullStubCatalog{tables: map[string]*table.Table{}}
+		mtx, err := NewMultiTableTransaction(stub)
+		require.NoError(t, err)
+
+		abortedTx := mtxTestTable(t, "db", "t1").NewTransaction()
+		require.NoError(t, abortedTx.SetProperties(map[string]string{"k": "v"}))
+		require.NoError(t, abortedTx.CleanupStagedFiles(t.Context()))
+		assert.ErrorContains(t, mtx.AddTransaction(abortedTx), "aborted")
+
+		laterAbortedTx := mtxTestTable(t, "db", "t2").NewTransaction()
+		require.NoError(t, laterAbortedTx.SetProperties(map[string]string{"k": "v"}))
+		require.NoError(t, mtx.AddTransaction(laterAbortedTx))
+		require.NoError(t, laterAbortedTx.CleanupStagedFiles(t.Context()))
+		assert.ErrorContains(t, mtx.Commit(t.Context()), "aborted")
+		assert.Empty(t, stub.commits)
+	}
+	{
+		// Uncertain CommitTransaction error marks child transactions committed so cleanup is a no-op.
+		uncertainErr := errors.New("gateway timeout")
+		stub := &fullStubCatalog{commitErr: uncertainErr, tables: map[string]*table.Table{}}
+		mtx, err := NewMultiTableTransaction(stub)
+		require.NoError(t, err)
+
+		tx := mtxTestTable(t, "db", "t1").NewTransaction()
+		require.NoError(t, tx.SetProperties(map[string]string{"k": "v"}))
+		require.NoError(t, mtx.AddTransaction(tx))
+
+		err = mtx.Commit(t.Context())
+		require.ErrorIs(t, err, uncertainErr)
+		_, tcErr := tx.TableCommit()
+		assert.ErrorContains(t, tcErr, "already been committed")
+		assert.ErrorContains(t, mtx.Commit(t.Context()), "already been committed")
+	}
+	{
+		// Definite ErrCommitFailed leaves child transactions uncommitted so staged files can be cleaned up.
+		stub := &fullStubCatalog{commitErr: table.ErrCommitFailed, tables: map[string]*table.Table{}}
+		mtx, err := NewMultiTableTransaction(stub)
+		require.NoError(t, err)
+
+		tx := mtxTestTable(t, "db", "t1").NewTransaction()
+		require.NoError(t, tx.SetProperties(map[string]string{"k": "v"}))
+		require.NoError(t, mtx.AddTransaction(tx))
+
+		err = mtx.Commit(t.Context())
+		require.ErrorIs(t, err, table.ErrCommitFailed)
+		_, tcErr := tx.TableCommit()
+		require.NoError(t, tcErr)
+		require.NoError(t, tx.CleanupStagedFiles(t.Context()))
+		_, tcErr = tx.TableCommit()
+		assert.ErrorContains(t, tcErr, "aborted")
+	}
+}

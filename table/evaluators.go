@@ -1943,22 +1943,9 @@ func newBloomFilterPredicatesFromRewritten(expr iceberg.BooleanExpression) ([]in
 	return iceberg.VisitExpr(expr, &bloomPredicateCollector{})
 }
 
-// newDictionaryPredicates reuses the same conservative EqualTo/In collector
-// as Bloom filters. The physical literal bytes are also the representation
-// needed to compare values decoded from a PLAIN dictionary page.
-func newDictionaryPredicates(expr iceberg.BooleanExpression) ([]internal.RowGroupDictionaryPred, error) {
-	if expr == nil {
-		return nil, nil
-	}
-
-	rewritten, err := iceberg.RewriteNotExpr(expr)
-	if err != nil {
-		return nil, err
-	}
-
-	return newDictionaryPredicatesFromRewritten(rewritten)
-}
-
+// newDictionaryPredicatesFromRewritten reuses the same conservative EqualTo/In
+// collector as Bloom filters. The physical literal bytes are also the
+// representation needed to compare values decoded from a PLAIN dictionary page.
 func newDictionaryPredicatesFromRewritten(expr iceberg.BooleanExpression) ([]internal.RowGroupDictionaryPred, error) {
 	bloomPreds, err := newBloomFilterPredicatesFromRewritten(expr)
 	if err != nil {

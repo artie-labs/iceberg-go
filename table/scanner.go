@@ -567,9 +567,13 @@ type Scan struct {
 	// value preserves the historical behavior for scans assembled directly in
 	// package tests with snapshotID/asOfTimestamp fields set.
 	useSnapshotSchema *bool
-	options           iceberg.Properties
-	limit             int64
-	selectorErr       error
+	// keepDeletesOutsideFilter keeps every delete file a planned data file
+	// may need, not only those whose stats overlap the row filter. A rewrite
+	// that keeps the rows the filter doesn't match needs those deletes too.
+	keepDeletesOutsideFilter bool
+	options                  iceberg.Properties
+	limit                    int64
+	selectorErr              error
 
 	includeRowLineage bool
 
@@ -1250,12 +1254,7 @@ func (scan *Scan) collectManifestEntriesWithSchemaOptionsAndMinSequenceNum(
 	projectScanColumns bool,
 	discardDeleted, discardExisting bool,
 ) (*manifestEntries, error) {
-	metricsEval, err := newInclusiveMetricsEvaluator(
-		schema,
-		scan.rowFilter,
-		scan.caseSensitive,
-		scan.options["include_empty_files"] == "true",
-	)
+	metricsEval, err := scan.manifestMetricsEvaluator(schema)
 	if err != nil {
 		return nil, err
 	}
@@ -1311,6 +1310,32 @@ func (scan *Scan) collectManifestEntriesWithSchemaOptionsAndMinSequenceNum(
 	}
 
 	return flattenClassifiedManifestEntries(manifestResults), nil
+}
+
+// manifestMetricsEvaluator prunes manifest entries whose column stats can't
+// match the row filter. With keepDeletesOutsideFilter set, it prunes data
+// files only.
+func (scan *Scan) manifestMetricsEvaluator(schema *iceberg.Schema) (func(iceberg.DataFile) (bool, error), error) {
+	metricsEval, err := newInclusiveMetricsEvaluator(
+		schema,
+		scan.rowFilter,
+		scan.caseSensitive,
+		scan.options["include_empty_files"] == "true",
+	)
+	if err != nil {
+		return nil, err
+	}
+	if !scan.keepDeletesOutsideFilter {
+		return metricsEval, nil
+	}
+
+	return func(df iceberg.DataFile) (bool, error) {
+		if df.ContentType() != iceberg.EntryContentData {
+			return true, nil
+		}
+
+		return metricsEval(df)
+	}, nil
 }
 
 func (scan *Scan) dataManifestProjection(retainDataFileStats bool) (iceberg.ManifestEntryProjection, bool) {
@@ -1378,12 +1403,7 @@ func (scan *Scan) planDataManifestTasksWithOptions(
 	projectScanColumns bool,
 	retainDataFileStats bool,
 ) ([]FileScanTask, error) {
-	metricsEval, err := newInclusiveMetricsEvaluator(
-		schema,
-		scan.rowFilter,
-		scan.caseSensitive,
-		scan.options["include_empty_files"] == "true",
-	)
+	metricsEval, err := scan.manifestMetricsEvaluator(schema)
 	if err != nil {
 		return nil, err
 	}

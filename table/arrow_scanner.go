@@ -1249,6 +1249,9 @@ type arrowScan struct {
 
 	// deleteMatcher, when set, narrows the rows a merge-on-read delete scan reports; see WithDeleteRowMatcher.
 	deleteMatcher *deleteRowMatcher
+	// existingDeleteBitmaps, when set, holds per-file already-deleted row positions (v3 DVs and legacy deletes)
+	// skipped before delete filters and deleteMatcher run.
+	existingDeleteBitmaps map[string]*dv.RoaringPositionBitmap
 
 	// arrowBatchSize, when positive, overrides the table's
 	// read.parquet.batch-size property for this scan's reads.
@@ -1967,68 +1970,17 @@ func (as *arrowScan) processRecordsWithPlans(
 	// stays enabled.
 	switch {
 	case task.Value.File.FileFormat() == iceberg.ParquetFile:
-		var tester *tblutils.ParquetRowGroupTester
-		if plans != nil && plans.pruning != nil {
-			tester = &tblutils.ParquetRowGroupTester{
-				StatsFn:         plans.pruning.statsEvaluator(),
-				BloomPreds:      plans.pruning.bloomPreds,
-				DictionaryPreds: plans.pruning.dictionaryPreds,
-			}
-		} else {
-			logicalSchema := as.filterSchema
-			if logicalSchema == nil {
-				logicalSchema = as.projectedSchema
-			}
-
-			hasMissingDefault, err := pruningFilterHasMissingInitialDefault(
-				pruningFilter, logicalSchema, fileSchema)
+		var pruning *compiledFileFilterPlan
+		if plans != nil {
+			pruning = plans.pruning
+		}
+		if pruning == nil {
+			pruning, err = compilePruningPlan(fileSchema, as.logicalFilterSchema(), pruningFilter, as.caseSensitive)
 			if err != nil {
 				return err
-			}
-			if hasMissingDefault {
-				// TranslateColumnNames treats fields missing from the physical file
-				// as null. That is unsafe for fields added with a non-null
-				// initial-default because Iceberg materializes the default on read.
-				// Keep the actual row filter, but conservatively skip early pruning.
-				pruningFilter = iceberg.AlwaysTrue{}
-			}
-
-			pruningFilter, err = stripExtractPredicates(pruningFilter)
-			if err != nil {
-				return err
-			}
-
-			filePruningFilter, err := iceberg.TranslateColumnNames(pruningFilter, fileSchema)
-			if err != nil {
-				return err
-			}
-
-			filePruningFilter, err = iceberg.BindExpr(fileSchema, filePruningFilter, as.caseSensitive)
-			if err != nil {
-				return err
-			}
-
-			statsFn, err := newParquetRowGroupStatsEvaluator(fileSchema, filePruningFilter, false)
-			if err != nil {
-				return err
-			}
-
-			bloomPreds, err := newBloomFilterPredicates(filePruningFilter)
-			if err != nil {
-				return err
-			}
-
-			dictionaryPreds, err := newDictionaryPredicates(filePruningFilter)
-			if err != nil {
-				return err
-			}
-
-			tester = &tblutils.ParquetRowGroupTester{
-				StatsFn:         statsFn,
-				BloomPreds:      bloomPreds,
-				DictionaryPreds: dictionaryPreds,
 			}
 		}
+		tester := pruning.rowGroupTester()
 		// A complete task already reads every row group. Leave its byte range
 		// unset so malformed or legacy row-group offsets cannot change the
 		// historical full-file behavior. A zero-value task is also treated as
@@ -2101,6 +2053,15 @@ func (as *arrowScan) processRecordsWithPlans(
 	}
 
 	return err
+}
+
+// logicalFilterSchema is the schema the scan's row filter is bound to.
+func (as *arrowScan) logicalFilterSchema() *iceberg.Schema {
+	if as.filterSchema != nil {
+		return as.filterSchema
+	}
+
+	return as.projectedSchema
 }
 
 func pruningFilterHasMissingInitialDefault(
@@ -2336,6 +2297,16 @@ func (as *arrowScan) producePosDeletesFromTask(ctx context.Context, task tblutil
 		}
 
 		pipeline = append(pipeline, processPositionalDeletes(ctx, deletes, posSource.cursor()))
+	}
+	if as.existingDeleteBitmaps != nil {
+		if existingDV := as.existingDeleteBitmaps[task.Value.File.FilePath()]; existingDV != nil {
+			if !existingDV.IsEmpty() {
+				if len(positionalDeletes) > 0 {
+					return fmt.Errorf("cannot apply both positional delete files and deletion vector bitmap for %s", task.Value.File.FilePath())
+				}
+				pipeline = append(pipeline, filterByDeletionVector(ctx, existingDV, task.Value.File.Count(), posSource.cursor()))
+			}
+		}
 	}
 
 	filterFunc, dropFile, err = as.getRecordFilterFromPlan(ctx, filterPlans.record)
