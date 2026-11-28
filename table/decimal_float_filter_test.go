@@ -132,6 +132,7 @@ func numericFilterTable(t *testing.T, mode, version string) *table.Table {
 		rdr.Release()
 		rec.Release()
 	}
+
 	return tbl
 }
 
@@ -142,6 +143,7 @@ func allNumericIDs() []int64 {
 			ids = append(ids, r.id)
 		}
 	}
+
 	return ids
 }
 
@@ -154,6 +156,7 @@ func big10(text string) iceberg.Decimal {
 	if err != nil {
 		panic(err)
 	}
+
 	return iceberg.Decimal{Val: n, Scale: 10}
 }
 
