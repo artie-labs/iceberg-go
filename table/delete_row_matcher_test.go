@@ -423,6 +423,50 @@ func TestDeleteRowMatcher(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, []int64{1, 3}, idsInTable(t, tbl))
 	})
+
+	t.Run("releases arrow memory across delete modes", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			version string
+			mode    string
+		}{
+			{name: "v1_cow", version: "1", mode: table.WriteModeCopyOnWrite},
+			{name: "v2_cow", version: "2", mode: table.WriteModeCopyOnWrite},
+			{name: "v2_mor", version: "2", mode: table.WriteModeMergeOnRead},
+			{name: "v3_mor", version: "3", mode: table.WriteModeMergeOnRead},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				tbl := newDeleteModeTestTable(t, tc.mode, tc.version)
+				data, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{
+					`[{"id":1,"data":"a"},{"id":2,"data":"a"},{"id":3,"data":"b"},{"id":4,"data":"b"}]`,
+				})
+				require.NoError(t, err)
+				defer data.Release()
+
+				tbl, err = tbl.Append(ctx, array.NewTableReader(data, -1), nil)
+				require.NoError(t, err)
+
+				alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+				deleteCtx := compute.WithAllocator(ctx, alloc)
+				matcher := func(callCtx context.Context, batch arrow.RecordBatch) (*array.Boolean, error) {
+					ids := batch.Column(batch.Schema().FieldIndices("id")[0]).(*array.Int64)
+					bldr := array.NewBooleanBuilder(compute.GetAllocator(callCtx))
+					defer bldr.Release()
+					for i := range int(batch.NumRows()) {
+						bldr.Append(ids.Value(i)%2 == 0)
+					}
+
+					return bldr.NewBooleanArray(), nil
+				}
+
+				tbl, err = tbl.Delete(deleteCtx, iceberg.AlwaysTrue{}, nil,
+					table.WithDeleteRowMatcher([]string{"id"}, matcher))
+				require.NoError(t, err)
+				alloc.AssertSize(t, 0)
+				assert.Equal(t, []int64{1, 3}, idsInTable(t, tbl))
+			})
+		}
+	})
 }
 
 type fixedCommitErrCatalog struct {
