@@ -20,12 +20,16 @@ package table_test
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/apache/iceberg-go"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
@@ -112,6 +116,76 @@ func TestDeleteRowMatcher(t *testing.T) {
 		tbl := newTable(t, "2")
 		_, err := tbl.Delete(ctx, superset, nil, table.WithDeleteRowMatcher([]string{"id"}, nil))
 		assert.ErrorContains(t, err, "delete row matcher function is required")
+	})
+	t.Run("rejects unknown delete row matcher column", func(t *testing.T) {
+		tbl := newTable(t, "2")
+		_, err := tbl.Delete(ctx, superset, nil, table.WithDeleteRowMatcher([]string{"missing"}, pairs("1:a")))
+		assert.ErrorContains(t, err, `delete row matcher column "missing" is not in the table schema`)
+	})
+	t.Run("skips no-op commit and uses fallback name mapping for field-ID-less files", func(t *testing.T) {
+		tbl := newMergeOnReadTestTableVersion(t, "2")
+		_, hasMapping := tbl.Properties()[table.DefaultNameMappingKey]
+		require.False(t, hasMapping, "setup: table should start without a name mapping")
+
+		// Write a Parquet file without Iceberg field IDs so the scan relies on buildScanMetadata's fallback mapping.
+		data, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{
+			`[{"id":1,"data":"a"},{"id":2,"data":"b"}]`,
+		})
+		require.NoError(t, err)
+		defer data.Release()
+
+		dataPath := filepath.Join(tbl.Location(), "data", "no-field-ids.parquet")
+		require.NoError(t, os.MkdirAll(filepath.Dir(dataPath), 0o755))
+		f, err := os.Create(dataPath)
+		require.NoError(t, err)
+		require.NoError(t, pqarrow.WriteTable(data, f, data.NumRows(), parquet.NewWriterProperties(), pqarrow.DefaultWriterProps()))
+
+		info, err := os.Stat(dataPath)
+		require.NoError(t, err)
+		bldr, err := iceberg.NewDataFileBuilder(*iceberg.UnpartitionedSpec, iceberg.EntryContentData, filepath.ToSlash(dataPath), iceberg.ParquetFile, nil, nil, nil, data.NumRows(), info.Size())
+		require.NoError(t, err)
+
+		txn := tbl.NewTransaction()
+		require.NoError(t, txn.AddDataFiles(ctx, []iceberg.DataFile{bldr.Build()}, nil, table.WithoutAutoNameMapping()))
+		tbl, err = txn.Commit(ctx)
+		require.NoError(t, err)
+
+		_, hasMapping = tbl.Properties()[table.DefaultNameMappingKey]
+		require.False(t, hasMapping, "setup: WithoutAutoNameMapping should not persist a name mapping")
+		snapBefore := tbl.CurrentSnapshot().SnapshotID
+
+		// A zero-match matcher delete scans via fallback mapping and skips staging a snapshot or name mapping.
+		var seenMu sync.Mutex
+		var seenIDs []int64
+		noMatch := func(_ context.Context, batch arrow.RecordBatch) (*array.Boolean, error) {
+			ids := batch.Column(batch.Schema().FieldIndices("id")[0]).(*array.Int64)
+			bldr := array.NewBooleanBuilder(memory.DefaultAllocator)
+			defer bldr.Release()
+			seenMu.Lock()
+			for i := range int(batch.NumRows()) {
+				seenIDs = append(seenIDs, ids.Value(i))
+				bldr.Append(false)
+			}
+			seenMu.Unlock()
+
+			return bldr.NewBooleanArray(), nil
+		}
+		tbl, err = tbl.Delete(ctx, iceberg.AlwaysTrue{}, iceberg.Properties{"checkpoint": "1"},
+			table.WithDeleteRowMatcher([]string{"id", "data"}, noMatch))
+		require.NoError(t, err)
+		assert.ElementsMatch(t, []int64{1, 2}, seenIDs)
+		assert.Equal(t, snapBefore, tbl.CurrentSnapshot().SnapshotID)
+		_, hasMapping = tbl.Properties()[table.DefaultNameMappingKey]
+		assert.False(t, hasMapping, "no-op matcher delete must not persist a default name mapping")
+
+		// A matching matcher delete persists the name mapping and commits a new snapshot.
+		tbl, err = tbl.Delete(ctx, iceberg.AlwaysTrue{}, nil,
+			table.WithDeleteRowMatcher([]string{"id", "data"}, pairs("1:a")))
+		require.NoError(t, err)
+		assert.NotEqual(t, snapBefore, tbl.CurrentSnapshot().SnapshotID)
+		_, hasMapping = tbl.Properties()[table.DefaultNameMappingKey]
+		assert.True(t, hasMapping, "matcher delete that modifies rows must persist default name mapping")
+		assert.Equal(t, []int64{2}, idsInTable(t, tbl))
 	})
 	t.Run("sees a renamed key column under its new name", func(t *testing.T) {
 		tbl := newTable(t, "2")

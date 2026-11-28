@@ -2548,23 +2548,31 @@ func (t *Transaction) performMergeOnReadDeletion(ctx context.Context, snapshotPr
 }
 
 func validateDeleteRowMatcherColumns(schema *iceberg.Schema, matcher *deleteRowMatcher, caseSensitive bool) error {
+	_, err := resolveDeleteRowMatcherFieldIDs(schema, matcher, caseSensitive)
+
+	return err
+}
+
+func resolveDeleteRowMatcherFieldIDs(schema *iceberg.Schema, matcher *deleteRowMatcher, caseSensitive bool) ([]int, error) {
 	if matcher == nil {
-		return nil
+		return nil, nil
 	}
 	if matcher.match == nil {
-		return errors.New("delete row matcher function is required")
+		return nil, errors.New("delete row matcher function is required")
 	}
+	fieldIDs := make([]int, 0, len(matcher.columns))
 	for _, name := range matcher.columns {
-		_, ok := schema.FindFieldByNameCaseInsensitive(name)
+		field, ok := schema.FindFieldByNameCaseInsensitive(name)
 		if caseSensitive {
-			_, ok = schema.FindFieldByName(name)
+			field, ok = schema.FindFieldByName(name)
 		}
 		if !ok {
-			return fmt.Errorf("delete row matcher column %q is not in the table schema", name)
+			return nil, fmt.Errorf("delete row matcher column %q is not in the table schema", name)
 		}
+		fieldIDs = append(fieldIDs, field.ID)
 	}
 
-	return nil
+	return fieldIDs, nil
 }
 
 // buildScanMetadata builds immutable metadata for an internal scan, populating a fallback default name mapping
@@ -2607,7 +2615,8 @@ type deleteRowMatcher struct {
 // columns match reads. The filter must then
 // match a superset of the rows to delete; it still prunes files and row groups. Use it when the exact rows are cheap to
 // test in Go but expensive as an expression, such as many composite keys: an OR of one conjunction per key is
-// evaluated against every row. Only merge-on-read deletes support it; a copy-on-write Delete returns an error.
+// evaluated against every row. When the matcher deletes no rows, Delete stages no snapshot and leaves snapshotProps and
+// schema.name-mapping.default unchanged. Only merge-on-read deletes support it; a copy-on-write Delete returns an error.
 func WithDeleteRowMatcher(columns []string, match DeleteRowMatcher) DeleteOption {
 	return func(op *deleteOperation) {
 		op.rowMatcher = &deleteRowMatcher{columns: columns, match: match}
@@ -3004,7 +3013,7 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 		scanTask.DataSequenceNumber = args.fileSeqNum
 	}
 
-	builtMeta, err := buildScanMetadata(meta)
+	builtMeta, err := meta.Build()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build metadata: %w", err)
 	}
@@ -3384,17 +3393,12 @@ func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs
 	for _, id := range filterIDs {
 		selected[id] = iceberg.Void{}
 	}
-	if matcher != nil {
-		for _, name := range matcher.columns {
-			field, ok := meta.CurrentSchema().FindFieldByNameCaseInsensitive(name)
-			if caseSensitive {
-				field, ok = meta.CurrentSchema().FindFieldByName(name)
-			}
-			if !ok {
-				return nil, fmt.Errorf("delete row matcher column %q is not in the table schema", name)
-			}
-			selected[field.ID] = iceberg.Void{}
-		}
+	matcherIDs, err := resolveDeleteRowMatcherFieldIDs(meta.CurrentSchema(), matcher, caseSensitive)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range matcherIDs {
+		selected[id] = iceberg.Void{}
 	}
 	projected, err := iceberg.PruneColumns(meta.CurrentSchema(), selected, false)
 	if err != nil {
