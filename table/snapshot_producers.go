@@ -856,6 +856,19 @@ func (sp *snapshotProducer) hasChanges() bool {
 	return len(sp.deletedDVsByRef) > 0
 }
 
+func (sp *snapshotProducer) registerValidator() {
+	impl := sp.producerImpl
+	if impl == nil {
+		return
+	}
+	if !impl.needsValidation() {
+		return
+	}
+	sp.txn.addValidator(func(cc *conflictContext) error {
+		return impl.validate(cc)
+	})
+}
+
 func (sp *snapshotProducer) newManifestWriter(spec iceberg.PartitionSpec, opts ...iceberg.ManifestWriterOption) (_ *iceberg.ManifestWriter, _ string, _ *internal.CountingWriter, _ io.Closer, err error) {
 	out, path, err := sp.newManifestOutput()
 	if err != nil {
@@ -1617,11 +1630,7 @@ func (sp *snapshotProducer) commitManifests(newManifests, addedContent []iceberg
 	// appends (fast-append, merge-append) opt out via needsValidation()
 	// == false and skip registration entirely. The nil guard remains for
 	// unit tests that drive commit() on a bare snapshotProducer.
-	if impl := sp.producerImpl; impl != nil && impl.needsValidation() {
-		sp.txn.validators = append(sp.txn.validators, func(cc *conflictContext) error {
-			return impl.validate(cc)
-		})
-	}
+	sp.registerValidator()
 
 	// Delete-file removals (path-keyed delete files and ref-keyed
 	// deletion vectors) are resolved against the snapshot this producer

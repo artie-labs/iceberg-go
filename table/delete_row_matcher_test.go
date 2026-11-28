@@ -515,6 +515,44 @@ func TestDeleteRowMatcher(t *testing.T) {
 		assert.True(t, hasMapping, "matcher delete that modifies rows must persist default name mapping")
 		assert.Equal(t, []int64{2}, idsInTable(t, tbl))
 	})
+	t.Run("no-op matcher delete still validates concurrent inserts before append", func(t *testing.T) {
+		tbl := newTable(t, "2")
+		txn := tbl.NewTransaction()
+
+		noMatch := func(_ context.Context, batch arrow.RecordBatch) (*array.Boolean, error) {
+			bldr := array.NewBooleanBuilder(memory.DefaultAllocator)
+			defer bldr.Release()
+			for range int(batch.NumRows()) {
+				bldr.Append(false)
+			}
+
+			return bldr.NewBooleanArray(), nil
+		}
+		// Delete key 5 (absent in base snapshot) — stages no snapshot, but must still register the serializable validator.
+		require.NoError(t, txn.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), int64(5)), nil,
+			table.WithDeleteRowMatcher([]string{"id"}, noMatch)))
+
+		// Concurrent writer commits a file containing key 5 before txn commits.
+		peerData, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{
+			`[{"id":5,"data":"peer"}]`,
+		})
+		require.NoError(t, err)
+		defer peerData.Release()
+		tbl, err = tbl.Append(ctx, array.NewTableReader(peerData, -1), nil)
+		require.NoError(t, err)
+
+		// txn appends key 5 (upsert pattern); commit must reject the concurrent conflict instead of duplicating key 5.
+		upsertData, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{
+			`[{"id":5,"data":"upsert"}]`,
+		})
+		require.NoError(t, err)
+		defer upsertData.Release()
+		require.NoError(t, txn.Append(ctx, array.NewTableReader(upsertData, -1), nil))
+
+		_, err = txn.Commit(ctx)
+		require.ErrorIs(t, err, table.ErrCommitFailed)
+		assert.Equal(t, []int64{1, 2, 3, 4, 5}, idsInTable(t, tbl))
+	})
 	t.Run("sees a renamed key column under its new name", func(t *testing.T) {
 		tbl := newTable(t, "2")
 		txn := tbl.NewTransaction()

@@ -2741,6 +2741,8 @@ func (t *Transaction) Delete(ctx context.Context, filter iceberg.BooleanExpressi
 
 	if deleteOp.rowMatcher != nil {
 		if !updater.hasChanges() {
+			updater.registerValidator()
+
 			return nil
 		}
 		if err := t.ensureNameMapping(); err != nil {
