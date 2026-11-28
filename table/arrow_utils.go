@@ -1991,6 +1991,8 @@ func binPackRecords(itr iter.Seq2[arrow.RecordBatch, error], recordLookback int,
 
 			rec.Retain()
 			if !yield(rec) {
+				rec.Release()
+
 				return
 			}
 		}
@@ -2276,6 +2278,10 @@ func positionDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 					Batches:     batch,
 				}
 				if !yield(t) {
+					for _, b := range t.Batches {
+						b.Release()
+					}
+
 					return
 				}
 			}

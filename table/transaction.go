@@ -3215,6 +3215,21 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 	if err != nil {
 		return nil, err
 	}
+	releasePosDeleteRecIter := func(yield func(arrow.RecordBatch, error) bool) {
+		for rec, err := range posDeleteRecIter {
+			if err != nil {
+				yield(nil, err)
+
+				return
+			}
+			if !yield(rec, nil) {
+				rec.Release()
+
+				return
+			}
+			rec.Release()
+		}
+	}
 
 	partitionContextByFilePath := make(map[string]partitionContext, len(files))
 	for _, df := range files {
@@ -3223,7 +3238,7 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 
 	posDeleteFiles := positionDeleteRecordsToDataFiles(ctx, t.tbl.Location(), meta, partitionContextByFilePath, recordWritingArgs{
 		sc:          PositionalDeleteArrowSchema,
-		itr:         posDeleteRecIter,
+		itr:         releasePosDeleteRecIter,
 		writeUUID:   &commitUUID,
 		fs:          wfs,
 		existingDVs: existingDVBitmaps,
