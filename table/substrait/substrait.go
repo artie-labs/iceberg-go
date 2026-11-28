@@ -412,22 +412,38 @@ func (t *toSubstraitExpr) makeRefFunc(id extensions.ID, term iceberg.BoundTerm) 
 	return t.bldr.ScalarFunc(id).Args(t.bldr.RootRef(t.getRef(term.Ref())))
 }
 
+// VisitIsNan guards is_nan with is_not_null: arrow-go's is_nan kernel writes no validity bitmap, so its result for a
+// NULL is whatever the null slot holds, which a Parquet read can leave as NaN. isNaN(NULL) is false.
 func (t *toSubstraitExpr) VisitIsNan(term iceberg.BoundTerm) expr.Builder {
-	return t.makeRefFunc(isNaNID, term)
+	return t.VisitAnd(t.makeRefFunc(isNotNullID, term), t.makeRefFunc(isNaNID, term))
 }
 
+// VisitNotNan is true for NULL, as notNaN is, whatever is_nan reads from the null slot (see VisitIsNan).
 func (t *toSubstraitExpr) VisitNotNan(term iceberg.BoundTerm) expr.Builder {
-	return t.bldr.ScalarFunc(notID).Args(
+	return t.VisitOr(t.makeRefFunc(isNullID, term), t.bldr.ScalarFunc(notID).Args(
 		t.makeRefFunc(isNaNID, term).(expr.FuncArgBuilder),
-	)
+	))
 }
 
 func (t *toSubstraitExpr) VisitIsNull(term iceberg.BoundTerm) expr.Builder {
-	return t.makeRefFunc(isNullID, term)
+	return t.nullTest(isNullID, term)
 }
 
 func (t *toSubstraitExpr) VisitNotNull(term iceberg.BoundTerm) expr.Builder {
-	return t.makeRefFunc(isNotNullID, term)
+	return t.nullTest(isNotNullID, term)
+}
+
+// nullTest applies is_null or is_not_null to term. arrow-go v18.8's is_null and is_not_null panic on a decimal
+// argument (their dispatch promotes decimal arguments as if there were two), so a decimal is tested through
+// equal(term, term), which is NULL exactly where term is. arrow-go v18.9 fixes the dispatch.
+func (t *toSubstraitExpr) nullTest(id extensions.ID, term iceberg.BoundTerm) expr.Builder {
+	if _, ok := term.Type().(iceberg.DecimalType); !ok {
+		return t.makeRefFunc(id, term)
+	}
+
+	same := t.bldr.ScalarFunc(equalID).Args(t.bldr.RootRef(t.getRef(term.Ref())), t.bldr.RootRef(t.getRef(term.Ref())))
+
+	return t.bldr.ScalarFunc(id).Args(same)
 }
 
 func (t *toSubstraitExpr) makeLitFunc(id extensions.ID, term iceberg.BoundTerm, lit iceberg.Literal) expr.Builder {

@@ -576,6 +576,9 @@ func (t *Transaction) rewriteDataFilesPartial(ctx context.Context, groups []Comp
 	if t.committed {
 		return nil, errors.New("transaction has already been committed")
 	}
+	if t.aborted {
+		return nil, errors.New("transaction has been aborted")
+	}
 	result := &RewriteResult{Table: t.tbl}
 	if len(meta.updates) > 0 || len(t.reqs) > 0 || len(t.validators) > 0 {
 		return nil, fmt.Errorf("%w: partial progress requires a fresh transaction",

@@ -114,6 +114,19 @@ type Transaction struct {
 
 	mx        sync.Mutex
 	committed bool
+	aborted   bool
+
+	stagedMu    sync.Mutex
+	stagedFiles []string
+}
+
+func (t *Transaction) recordStagedFile(path string) {
+	if path == "" {
+		return
+	}
+	t.stagedMu.Lock()
+	t.stagedFiles = append(t.stagedFiles, path)
+	t.stagedMu.Unlock()
 }
 
 func (t *Transaction) ensureInitialized() error {
@@ -155,6 +168,22 @@ func (t *Transaction) checkNotNil() error {
 	return nil
 }
 
+func (t *Transaction) checkActive() error {
+	if err := t.checkNotNil(); err != nil {
+		return err
+	}
+	t.mx.Lock()
+	defer t.mx.Unlock()
+	if t.committed {
+		return errors.New("transaction has already been committed")
+	}
+	if t.aborted {
+		return errors.New("transaction has been aborted")
+	}
+
+	return nil
+}
+
 func (t *Transaction) apply(updates []Update, reqs []Requirement) error {
 	if err := t.checkNotNil(); err != nil {
 		return err
@@ -169,6 +198,9 @@ func (t *Transaction) apply(updates []Update, reqs []Requirement) error {
 
 	if t.committed {
 		return errors.New("transaction has already been committed")
+	}
+	if t.aborted {
+		return errors.New("transaction has been aborted")
 	}
 
 	stagedMeta := meta.clone()
@@ -887,6 +919,9 @@ func (t *Transaction) AppendTable(ctx context.Context, tbl arrow.Table, batchSiz
 }
 
 func (t *Transaction) Append(ctx context.Context, rdr array.RecordReader, snapshotProps iceberg.Properties) error {
+	if err := t.checkActive(); err != nil {
+		return err
+	}
 	meta, err := t.txnMeta()
 	if err != nil {
 		return err
@@ -911,6 +946,7 @@ func (t *Transaction) Append(ctx context.Context, rdr array.RecordReader, snapsh
 		if err != nil {
 			return err
 		}
+		t.recordStagedFile(df.FilePath())
 		appendFiles.appendDataFile(df)
 	}
 
@@ -2374,6 +2410,9 @@ func WithOverwriteCaseInsensitive() OverwriteOption {
 // can be overridden using the WithOverwriteConcurrency option.
 // If concurrency <= 0, defaults to runtime.GOMAXPROCS(0).
 func (t *Transaction) Overwrite(ctx context.Context, rdr array.RecordReader, snapshotProps iceberg.Properties, opts ...OverwriteOption) error {
+	if err := t.checkActive(); err != nil {
+		return err
+	}
 	if _, err := t.txnMeta(); err != nil {
 		return err
 	}
@@ -2410,6 +2449,7 @@ func (t *Transaction) Overwrite(ctx context.Context, rdr array.RecordReader, sna
 		if err != nil {
 			return err
 		}
+		t.recordStagedFile(df.FilePath())
 		updater.appendDataFile(df)
 	}
 
@@ -2653,6 +2693,9 @@ func WithDeleteCaseInsensitive() DeleteOption {
 // The concurrency parameter controls the level of parallelism for manifest processing and file rewriting and
 // can be overridden using the WithOverwriteConcurrency option. Defaults to runtime.GOMAXPROCS(0).
 func (t *Transaction) Delete(ctx context.Context, filter iceberg.BooleanExpression, snapshotProps iceberg.Properties, opts ...DeleteOption) (err error) {
+	if err := t.checkActive(); err != nil {
+		return err
+	}
 	meta, err := t.txnMeta()
 	if err != nil {
 		return err
@@ -2973,6 +3016,7 @@ func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, upda
 		for _, rewrittenFile := range rewrittenFiles {
 			path := rewrittenFile.FilePath()
 			writtenPaths = append(writtenPaths, path)
+			t.recordStagedFile(path)
 			updater.appendDataFile(rewrittenFile)
 		}
 	}
@@ -3226,7 +3270,7 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 		scanDeletes = nil
 	}
 
-	posDeleteRecIter, err := t.makePositionDeleteRecordsForFilter(ctx, fs, files, scanDeletes, filter, caseSensitive, concurrency, matcher)
+	posDeleteRecIter, err := t.makePositionDeleteRecordsForFilter(ctx, fs, files, scanDeletes, existingDVBitmaps, filter, caseSensitive, concurrency, matcher)
 	if err != nil {
 		return nil, err
 	}
@@ -3270,6 +3314,7 @@ func (t *Transaction) writePositionDeletesForFiles(ctx context.Context, fs io.IO
 		}
 		path := f.FilePath()
 		writtenPaths = append(writtenPaths, path)
+		t.recordStagedFile(path)
 		updater.appendDeleteFile(f)
 		if ref := iceberginternal.BorrowedDataFileReferencedDataFile(f); ref != nil {
 			if *ref != "" {
@@ -3437,7 +3482,7 @@ func (t *Transaction) plannedDeletesForFilter(ctx context.Context, meta *Metadat
 	return tasks, nil
 }
 
-func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs io.IO, files []iceberg.DataFile, existingDeletes map[string][]iceberg.DataFile, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int, matcher *deleteRowMatcher) (seq2 iter.Seq2[arrow.RecordBatch, error], err error) {
+func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs io.IO, files []iceberg.DataFile, existingDeletes map[string][]iceberg.DataFile, existingDVBitmaps map[string]*dv.RoaringPositionBitmap, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int, matcher *deleteRowMatcher) (seq2 iter.Seq2[arrow.RecordBatch, error], err error) {
 	meta, err := t.txnMeta()
 	if err != nil {
 		return nil, err
@@ -3490,15 +3535,16 @@ func (t *Transaction) makePositionDeleteRecordsForFilter(ctx context.Context, fs
 	}
 
 	scanner := &arrowScan{
-		metadata:        builtMeta,
-		fs:              fs,
-		scanSchema:      meta.CurrentSchema(),
-		projectedSchema: projected,
-		boundRowFilter:  boundFilter,
-		caseSensitive:   caseSensitive,
-		rowLimit:        -1, // No limit
-		concurrency:     concurrency,
-		deleteMatcher:   matcher,
+		metadata:              builtMeta,
+		fs:                    fs,
+		scanSchema:            meta.CurrentSchema(),
+		projectedSchema:       projected,
+		boundRowFilter:        boundFilter,
+		caseSensitive:         caseSensitive,
+		rowLimit:              -1, // No limit
+		concurrency:           concurrency,
+		deleteMatcher:         matcher,
+		existingDeleteBitmaps: existingDVBitmaps,
 	}
 	invariants, err := scanner.scanInvariants(builtMeta.Properties())
 	if err != nil {
@@ -3652,6 +3698,9 @@ func (t *Transaction) Commit(ctx context.Context) (*Table, error) {
 	if t.committed {
 		return nil, errors.New("transaction has already been committed")
 	}
+	if t.aborted {
+		return nil, errors.New("transaction has been aborted")
+	}
 
 	if len(meta.updates) > 0 {
 		reqs := append(transactionRequirements(t.reqs, t.branch, t.tbl.metadata), AssertTableUUID(meta.uuid))
@@ -3663,10 +3712,14 @@ func (t *Transaction) Commit(ctx context.Context) (*Table, error) {
 		)
 		if err != nil {
 			// A clean conflict (ErrCommitFailed) committed nothing and stays
-			// retriable. Any other failure leaves the commit state unknown
-			// (the catalog may have accepted it), so mark it terminal to
-			// avoid a double-apply on retry.
-			if !errors.Is(err, ErrCommitFailed) {
+			// retriable. ErrCommitDiverged failed validation before CommitTable
+			// was sent, so it cannot be retried but its staged files are safe
+			// to clean up. Any other failure leaves the commit state unknown
+			// (the catalog may have accepted it), so mark it committed to
+			// prevent both retries and staged-file deletion.
+			if errors.Is(err, ErrCommitDiverged) {
+				t.aborted = true
+			} else if !errors.Is(err, ErrCommitFailed) {
 				t.committed = true
 			}
 
@@ -3692,6 +3745,62 @@ func (t *Transaction) Commit(ctx context.Context) (*Table, error) {
 	return t.tbl, nil
 }
 
+// CleanupStagedFiles removes data, delete, manifest, and manifest-list files written by this transaction (via Append,
+// Overwrite, Delete, WriteEqualityDeletes, and snapshot producers) when it has not been committed and did not end in
+// an uncertain commit outcome. Once Commit succeeds or fails with a non-conflict error whose catalog outcome is
+// unknown, t.committed is true and CleanupStagedFiles is a no-op so referenced files are never removed. Calling
+// CleanupStagedFiles marks the transaction aborted so it cannot be committed afterwards; if resolving FileIO or
+// removing a subset of files fails, the unremoved paths remain tracked so a retry with a fresh context can complete
+// cleanup.
+func (t *Transaction) CleanupStagedFiles(ctx context.Context) error {
+	if err := t.checkNotNil(); err != nil {
+		return err
+	}
+	t.mx.Lock()
+	if t.committed {
+		t.mx.Unlock()
+
+		return nil
+	}
+	t.aborted = true
+	t.mx.Unlock()
+
+	t.stagedMu.Lock()
+	paths := t.stagedFiles
+	t.stagedFiles = nil
+	t.stagedMu.Unlock()
+
+	if len(paths) == 0 {
+		return nil
+	}
+
+	fs, err := t.tbl.fsF(ctx)
+	if err != nil {
+		t.recordStagedFiles(paths)
+
+		return err
+	}
+	wfs, err := requireWriteFileIO(fs)
+	if err != nil {
+		t.recordStagedFiles(paths)
+
+		return err
+	}
+
+	remaining, removeErr := removeStagedPaths(wfs, paths)
+	t.recordStagedFiles(remaining)
+
+	return removeErr
+}
+
+func (t *Transaction) recordStagedFiles(paths []string) {
+	if len(paths) == 0 {
+		return
+	}
+	t.stagedMu.Lock()
+	t.stagedFiles = append(t.stagedFiles, paths...)
+	t.stagedMu.Unlock()
+}
 func removeDataFiles(wfs io.WriteFileIO, files []iceberg.DataFile) ([]string, error) {
 	paths := make([]string, len(files))
 	for i, df := range files {
@@ -3718,9 +3827,6 @@ func removeStagedPaths(wfs io.WriteFileIO, paths []string) ([]string, error) {
 			continue
 		}
 		if errors.Is(err, iofs.ErrNotExist) {
-			continue
-		}
-		if os.IsNotExist(err) {
 			continue
 		}
 		remaining = append(remaining, path)

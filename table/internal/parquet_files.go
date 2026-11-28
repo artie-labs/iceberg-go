@@ -1947,6 +1947,79 @@ type RowGroupSpan struct {
 	NumRows     int64
 }
 
+// prunes reports whether the tester has any statistics, dictionary or bloom
+// filter check.
+func (t *ParquetRowGroupTester) prunes() bool {
+	return t.StatsFn != nil || len(t.DictionaryPreds) > 0 || len(t.BloomPreds) > 0
+}
+
+// RowGroupChecker applies a ParquetRowGroupTester's statistics, dictionary and
+// bloom filter checks to the row groups of one Parquet file. It ignores the
+// tester's range and Survivors. It is not safe for concurrent use, because the
+// statistics evaluator keeps per-row-group state.
+type RowGroupChecker struct {
+	tester           *ParquetRowGroupTester
+	fileMeta         *metadata.FileMetaData
+	cols             []int
+	fieldIDToColIdx  map[int]int
+	dictionaryPreds  map[int][]int
+	dictionaryReader *file.Reader
+	bfReader         *metadata.BloomFilterReader
+}
+
+// NewRowGroupChecker returns a checker of rdr's row groups. cols are the leaf
+// columns whose statistics the tester's StatsFn reads. Dictionary pages are
+// read through rdr.
+func NewRowGroupChecker(tester *ParquetRowGroupTester, rdr *file.Reader, cols []int) *RowGroupChecker {
+	c := &RowGroupChecker{tester: tester, fileMeta: rdr.MetaData(), cols: cols}
+	if len(tester.BloomPreds) > 0 || len(tester.DictionaryPreds) > 0 {
+		c.fieldIDToColIdx = buildFieldIDToColIdx(c.fileMeta)
+	}
+	if len(tester.DictionaryPreds) > 0 {
+		c.dictionaryPreds = groupRowGroupDictionaryPredicates(c.fieldIDToColIdx, tester.DictionaryPreds)
+		if len(c.dictionaryPreds) > 0 {
+			c.dictionaryReader = rdr
+		}
+	}
+	if len(tester.BloomPreds) > 0 {
+		c.bfReader = rdr.GetBloomFilterReader()
+	}
+
+	return c
+}
+
+func (c *RowGroupChecker) readsDictionaries() bool {
+	return len(c.dictionaryPreds) > 0
+}
+
+// Keep reports whether row group rg may hold rows that match: false only when
+// its statistics, dictionaries or bloom filters rule out every row.
+func (c *RowGroupChecker) Keep(rg int) (bool, error) {
+	return c.keep(rg, nil)
+}
+
+// keep is Keep with rg's metadata, which it reads from the footer when nil.
+func (c *RowGroupChecker) keep(rg int, rgMeta *metadata.RowGroupMetaData) (bool, error) {
+	if rgMeta == nil && (c.tester.StatsFn != nil || c.bfReader != nil || len(c.dictionaryPreds) > 0) {
+		rgMeta = c.fileMeta.RowGroup(rg)
+	}
+	if c.tester.StatsFn != nil {
+		use, err := c.tester.StatsFn(rgMeta, c.cols)
+		if err != nil || !use {
+			return false, err
+		}
+	}
+	if len(c.dictionaryPreds) > 0 && !checkRowGroupDictionaries(
+		c.dictionaryReader, c.fileMeta, rgMeta, rg, c.dictionaryPreds, c.tester.DictionaryPreds) {
+		return false, nil
+	}
+	if c.bfReader != nil {
+		return checkRowGroupBloomFilters(c.bfReader, rg, c.fieldIDToColIdx, c.tester.BloomPreds)
+	}
+
+	return true, nil
+}
+
 type wrapPqArrowReader struct {
 	*pqarrow.FileReader
 	rowGroupInfos []parquetRowGroupInfo
@@ -2052,9 +2125,7 @@ func (w wrapPqArrowReader) GetRecords(ctx context.Context, cols []int, tester an
 	}
 
 	var rgList []int
-	if rowGroupTester != nil && (rangeSet ||
-		rowGroupTester.StatsFn != nil || len(rowGroupTester.DictionaryPreds) > 0 ||
-		len(rowGroupTester.BloomPreds) > 0) {
+	if rowGroupTester != nil && (rangeSet || rowGroupTester.prunes()) {
 		fileMeta := w.ParquetReader().MetaData()
 		numRg := w.ParquetReader().NumRowGroups()
 		planningOffsets := rowGroupTester.PlanningSplitOffsets
@@ -2062,37 +2133,19 @@ func (w wrapPqArrowReader) GetRecords(ctx context.Context, cols []int, tester an
 			planningOffsets = nil
 		}
 
-		var (
-			fieldIDToColIdx  map[int]int
-			bfReader         *metadata.BloomFilterReader
-			dictionaryReader *file.Reader
-		)
-
-		if len(rowGroupTester.BloomPreds) > 0 || len(rowGroupTester.DictionaryPreds) > 0 {
-			fieldIDToColIdx = buildFieldIDToColIdx(fileMeta)
-		}
-		var dictionaryPredsByColumn map[int][]int
-		if len(rowGroupTester.DictionaryPreds) > 0 {
-			dictionaryPredsByColumn = groupRowGroupDictionaryPredicates(
-				fieldIDToColIdx, rowGroupTester.DictionaryPreds)
-			if len(dictionaryPredsByColumn) > 0 && w.dictionarySource != nil {
-				// Dictionary inspection is an optional optimisation. If the
-				// section-read reader cannot be created, use the main reader and
-				// keep the existing conservative behaviour.
-				dictionaryReader, _ = newParquetDictionaryReader(
-					w.dictionarySource, fileMeta, w.dictionaryMem)
-				if dictionaryReader != nil {
-					// The temporary reader owns only its buffers. Its source is
-					// wrapped so this cannot close the main reader's input.
-					defer dictionaryReader.Close()
-				}
+		checker := NewRowGroupChecker(rowGroupTester, w.ParquetReader(), cols)
+		if checker.readsDictionaries() && w.dictionarySource != nil {
+			// Dictionary inspection is an optional optimisation. If the
+			// section-read reader cannot be created, use the main reader and
+			// keep the existing conservative behaviour.
+			dictionaryReader, _ := newParquetDictionaryReader(
+				w.dictionarySource, fileMeta, w.dictionaryMem)
+			if dictionaryReader != nil {
+				// The temporary reader owns only its buffers. Its source is
+				// wrapped so this cannot close the main reader's input.
+				defer dictionaryReader.Close()
+				checker.dictionaryReader = dictionaryReader
 			}
-			if len(dictionaryPredsByColumn) > 0 && dictionaryReader == nil {
-				dictionaryReader = w.ParquetReader()
-			}
-		}
-		if len(rowGroupTester.BloomPreds) > 0 {
-			bfReader = w.ParquetReader().GetBloomFilterReader()
 		}
 
 		if rowGroupTester.Survivors != nil {
@@ -2129,29 +2182,9 @@ func (w wrapPqArrowReader) GetRecords(ctx context.Context, cols []int, tester an
 				}
 				use = offset >= rangeStart && offset < rangeEnd
 			}
-			if use && (rowGroupTester.StatsFn != nil || bfReader != nil) && rgMeta == nil {
-				rgMeta = fileMeta.RowGroup(rg)
-			}
-			if use && rowGroupTester.StatsFn != nil {
+			if use {
 				var err error
-				use, err = rowGroupTester.StatsFn(rgMeta, cols)
-				if err != nil {
-					return nil, err
-				}
-			}
-
-			if use && len(dictionaryPredsByColumn) > 0 {
-				if rgMeta == nil {
-					rgMeta = fileMeta.RowGroup(rg)
-				}
-				use = checkRowGroupDictionaries(
-					dictionaryReader, fileMeta, rgMeta, rg,
-					dictionaryPredsByColumn, rowGroupTester.DictionaryPreds)
-			}
-
-			if use && bfReader != nil {
-				var err error
-				use, err = checkRowGroupBloomFilters(bfReader, rg, fieldIDToColIdx, rowGroupTester.BloomPreds)
+				use, err = checker.keep(rg, rgMeta)
 				if err != nil {
 					return nil, err
 				}
