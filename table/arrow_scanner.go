@@ -1967,68 +1967,17 @@ func (as *arrowScan) processRecordsWithPlans(
 	// stays enabled.
 	switch {
 	case task.Value.File.FileFormat() == iceberg.ParquetFile:
-		var tester *tblutils.ParquetRowGroupTester
-		if plans != nil && plans.pruning != nil {
-			tester = &tblutils.ParquetRowGroupTester{
-				StatsFn:         plans.pruning.statsEvaluator(),
-				BloomPreds:      plans.pruning.bloomPreds,
-				DictionaryPreds: plans.pruning.dictionaryPreds,
-			}
-		} else {
-			logicalSchema := as.filterSchema
-			if logicalSchema == nil {
-				logicalSchema = as.projectedSchema
-			}
-
-			hasMissingDefault, err := pruningFilterHasMissingInitialDefault(
-				pruningFilter, logicalSchema, fileSchema)
+		var pruning *compiledFileFilterPlan
+		if plans != nil {
+			pruning = plans.pruning
+		}
+		if pruning == nil {
+			pruning, err = compilePruningPlan(fileSchema, as.logicalFilterSchema(), pruningFilter, as.caseSensitive)
 			if err != nil {
 				return err
-			}
-			if hasMissingDefault {
-				// TranslateColumnNames treats fields missing from the physical file
-				// as null. That is unsafe for fields added with a non-null
-				// initial-default because Iceberg materializes the default on read.
-				// Keep the actual row filter, but conservatively skip early pruning.
-				pruningFilter = iceberg.AlwaysTrue{}
-			}
-
-			pruningFilter, err = stripExtractPredicates(pruningFilter)
-			if err != nil {
-				return err
-			}
-
-			filePruningFilter, err := iceberg.TranslateColumnNames(pruningFilter, fileSchema)
-			if err != nil {
-				return err
-			}
-
-			filePruningFilter, err = iceberg.BindExpr(fileSchema, filePruningFilter, as.caseSensitive)
-			if err != nil {
-				return err
-			}
-
-			statsFn, err := newParquetRowGroupStatsEvaluator(fileSchema, filePruningFilter, false)
-			if err != nil {
-				return err
-			}
-
-			bloomPreds, err := newBloomFilterPredicates(filePruningFilter)
-			if err != nil {
-				return err
-			}
-
-			dictionaryPreds, err := newDictionaryPredicates(filePruningFilter)
-			if err != nil {
-				return err
-			}
-
-			tester = &tblutils.ParquetRowGroupTester{
-				StatsFn:         statsFn,
-				BloomPreds:      bloomPreds,
-				DictionaryPreds: dictionaryPreds,
 			}
 		}
+		tester := pruning.rowGroupTester()
 		// A complete task already reads every row group. Leave its byte range
 		// unset so malformed or legacy row-group offsets cannot change the
 		// historical full-file behavior. A zero-value task is also treated as
@@ -2101,6 +2050,15 @@ func (as *arrowScan) processRecordsWithPlans(
 	}
 
 	return err
+}
+
+// logicalFilterSchema is the schema the scan's row filter is bound to.
+func (as *arrowScan) logicalFilterSchema() *iceberg.Schema {
+	if as.filterSchema != nil {
+		return as.filterSchema
+	}
+
+	return as.projectedSchema
 }
 
 func pruningFilterHasMissingInitialDefault(

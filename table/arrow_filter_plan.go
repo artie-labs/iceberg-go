@@ -62,6 +62,16 @@ func (p *compiledFileFilterPlan) recordProcessor(ctx context.Context) recProcess
 	return filterRecords(ctx, p.recordFilter)
 }
 
+// rowGroupTester returns the plan's row-group statistics, dictionary and bloom
+// filter checks.
+func (p *compiledFileFilterPlan) rowGroupTester() *tblutils.ParquetRowGroupTester {
+	return &tblutils.ParquetRowGroupTester{
+		StatsFn:         p.statsEvaluator(),
+		BloomPreds:      p.bloomPreds,
+		DictionaryPreds: p.dictionaryPreds,
+	}
+}
+
 func (p *compiledFileFilterPlan) statsEvaluator() func(*metadata.RowGroupMetaData, []int) (bool, error) {
 	// Passing an AlwaysTrue evaluator still allocates fresh metric maps for
 	// every row group. A nil evaluator has the same keep-all semantics and lets
@@ -136,23 +146,7 @@ func (as *arrowScan) cachedFileFilterPlans(fileSchema *iceberg.Schema, includePr
 		pruningFilter = as.boundRowFilter
 	}
 
-	logicalSchema := as.filterSchema
-	if logicalSchema == nil {
-		logicalSchema = as.projectedSchema
-	}
-	hasMissingDefault, err := pruningFilterHasMissingInitialDefault(
-		pruningFilter, logicalSchema, fileSchema)
-	if err != nil {
-		return nil, err
-	}
-	if hasMissingDefault {
-		// TranslateColumnNames treats fields missing from the physical file as
-		// null. That is unsafe for an initial default, so keep pruning disabled
-		// just as the uncached path does.
-		pruningFilter = iceberg.AlwaysTrue{}
-	}
-
-	pruning, err := compileFileFilterPlan(fileSchema, pruningFilter, as.caseSensitive, false, true)
+	pruning, err := compilePruningPlan(fileSchema, as.logicalFilterSchema(), pruningFilter, as.caseSensitive)
 	if err != nil {
 		return nil, err
 	}
@@ -395,6 +389,30 @@ func compileFileFilterPlan(
 	plan.extensionRegistry = extSet
 
 	return plan, nil
+}
+
+// compilePruningPlan compiles the row-group pruning checks of rowFilter, which
+// is bound to logicalSchema, for a file with fileSchema. TranslateColumnNames
+// treats a column missing from the file as null, which is wrong for a column
+// added with a non-null initial default because reads fill in the default, so
+// a filter on such a column prunes nothing.
+func compilePruningPlan(
+	fileSchema, logicalSchema *iceberg.Schema,
+	rowFilter iceberg.BooleanExpression,
+	caseSensitive bool,
+) (*compiledFileFilterPlan, error) {
+	if rowFilter == nil {
+		rowFilter = iceberg.AlwaysTrue{}
+	}
+	hasMissingDefault, err := pruningFilterHasMissingInitialDefault(rowFilter, logicalSchema, fileSchema)
+	if err != nil {
+		return nil, err
+	}
+	if hasMissingDefault {
+		rowFilter = iceberg.AlwaysTrue{}
+	}
+
+	return compileFileFilterPlan(fileSchema, rowFilter, caseSensitive, false, true)
 }
 
 // stripExtractPredicates replaces variant extract predicates, and any NOT over them, with AlwaysTrue for stats/bloom pruning.
