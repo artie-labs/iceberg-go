@@ -105,7 +105,11 @@ func (m *MultiTableTransaction) AddTransaction(tx *table.Transaction) error {
 
 // Commit extracts pending changes from all added transactions and
 // commits them atomically. On success, all transactions are marked
-// as committed. On failure, no transactions are marked committed.
+// as committed. On a definite conflict ([table.ErrCommitFailed]), no
+// transactions are marked committed so staged files may be cleaned up.
+// On any other failure whose catalog outcome is uncertain, all
+// transactions are marked committed to prevent reuse or deletion of
+// potentially referenced files.
 //
 // A retry must be rebuilt from freshly loaded tables:
 // each payload asserts the branch head its transaction read.
@@ -144,6 +148,13 @@ func (m *MultiTableTransaction) Commit(ctx context.Context) error {
 
 	if len(commits) > 0 {
 		if err := m.cat.CommitTransaction(ctx, commits); err != nil {
+			if !errors.Is(err, table.ErrCommitFailed) {
+				m.committed = true
+				for _, tx := range m.txns {
+					tx.MarkCommitted()
+				}
+			}
+
 			return fmt.Errorf("commit transaction for tables [%s]: %w",
 				strings.Join(names, ", "), err)
 		}

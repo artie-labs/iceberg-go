@@ -69,6 +69,9 @@ func (t *Transaction) TableCommit() (TableCommit, error) {
 	if t.committed {
 		return TableCommit{}, errors.New("transaction has already been committed")
 	}
+	if t.aborted {
+		return TableCommit{}, errors.New("transaction has been aborted")
+	}
 
 	if len(meta.updates) == 0 {
 		return TableCommit{
