@@ -839,6 +839,22 @@ func (sp *snapshotProducer) deleteFileRemoved(df iceberg.DataFile) bool {
 	return false
 }
 
+func (sp *snapshotProducer) hasChanges() bool {
+	if len(sp.addedFiles) > 0 {
+		return true
+	}
+	if len(sp.addedDeleteFiles) > 0 {
+		return true
+	}
+	if len(sp.deletedFiles) > 0 {
+		return true
+	}
+	if len(sp.deletedDeleteFiles) > 0 {
+		return true
+	}
+	return len(sp.deletedDVsByRef) > 0
+}
+
 func (sp *snapshotProducer) newManifestWriter(spec iceberg.PartitionSpec, opts ...iceberg.ManifestWriterOption) (_ *iceberg.ManifestWriter, _ string, _ *internal.CountingWriter, _ io.Closer, err error) {
 	out, path, err := sp.newManifestOutput()
 	if err != nil {
@@ -850,6 +866,9 @@ func (sp *snapshotProducer) newManifestWriter(spec iceberg.PartitionSpec, opts .
 		sp.txn.meta.CurrentSchema(), sp.snapshotID, opts...)
 	if err != nil {
 		return nil, "", nil, nil, errors.Join(err, out.Close(), sp.io.Remove(path))
+	}
+	if sp.txn != nil {
+		sp.txn.recordStagedFile(path)
 	}
 
 	return wr, path, counter, out, nil
@@ -1570,6 +1589,9 @@ func (sp *snapshotProducer) commitManifests(newManifests, addedContent []iceberg
 	if err != nil {
 		return nil, nil, err
 	}
+	if sp.txn != nil {
+		sp.txn.recordStagedFile(manifestListFilePath)
+	}
 
 	snapshot := Snapshot{
 		SnapshotID:       sp.snapshotID,
@@ -1731,6 +1753,9 @@ func (sp *snapshotProducer) commitManifests(newManifests, addedContent []iceberg
 		)
 		if writeErr != nil {
 			return nil, fmt.Errorf("rebuild manifest list: write: %w", writeErr)
+		}
+		if sp.txn != nil {
+			sp.txn.recordStagedFile(manifestListPath)
 		}
 
 		rebuilt := capturedSnapshot
